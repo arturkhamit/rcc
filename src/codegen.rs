@@ -77,7 +77,8 @@ pub fn codegen(globals: &[Obj]) -> String {
     let mut work: Vec<&str> = Vec::new();
     for o in globals.iter().filter(|o| o.is_def) {
         if !o.is_func {
-            work.extend(o.relocs.iter().map(|r| r.label.as_str()));
+            // A relocation against a label (`&&l` in a static table) keeps its function.
+            work.extend(o.relocs.iter().map(|r| r.label.strip_prefix(".L.u.").and_then(|l| l.split('.').next()).unwrap_or(&r.label)));
         } else if !o.is_static {
             work.push(&o.name);
         }
@@ -571,6 +572,8 @@ impl<'a> Gen<'a> {
                 emit!(self, "  lea {}(%rbp), %rdi\n  mov %rdi, 8(%rax)", self.va.2);
                 emit!(self, "  lea {}(%rbp), %rdi\n  mov %rdi, 16(%rax)", self.offs[area]);
             }
+            NK::LabelAddr(l) => emit!(self, "  lea {}(%rip), %rax", l),
+            NK::FrameAddr => emit!(self, "  mov %rbp, %rax"),
             NK::Call { f, args, ret_buf } => self.gen_call(n, f, args, *ret_buf),
             NK::Bin(op, l, r) => self.gen_bin(*op, l, r),
             _ => error_at(n.loc.0, n.loc.1, "statement used as an expression"),
@@ -840,7 +843,17 @@ impl<'a> Gen<'a> {
             NK::Switch { cond, body, cases, default, brk } => {
                 self.gen_expr(cond);
                 let wide = cond.ty.size() == 8;
-                for (v, l) in cases {
+                for (v, hi, l) in cases {
+                    if v != hi {
+                        // Range: (x - lo) <= (hi - lo), unsigned.
+                        if wide {
+                            emit!(self, "  mov %rax, %rdi\n  mov ${}, %rsi\n  sub %rsi, %rdi\n  mov ${}, %rsi\n  cmp %rsi, %rdi", v, hi.wrapping_sub(*v));
+                        } else {
+                            emit!(self, "  mov %eax, %edi\n  sub ${}, %edi\n  cmp ${}, %edi", *v as i32, hi.wrapping_sub(*v) as i32);
+                        }
+                        emit!(self, "  jbe {}", l);
+                        continue;
+                    }
                     if !wide {
                         emit!(self, "  cmp ${}, %eax", *v as i32);
                     } else if *v == *v as i32 as i64 {
@@ -859,6 +872,10 @@ impl<'a> Gen<'a> {
                 self.gen_stmt(body);
             }
             NK::Goto(l) => emit!(self, "  jmp {}", l),
+            NK::GotoExpr(e) => {
+                self.gen_expr(e);
+                emit!(self, "  jmp *%rax");
+            }
             NK::Block(v) => {
                 for s in v {
                     self.gen_stmt(s);

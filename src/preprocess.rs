@@ -113,6 +113,7 @@ pub struct Preprocessor {
     pushed: HashMap<String, Vec<Option<Rc<Macro>>>>,
     counter: i64,
     depth: usize,
+    pub prelude: Vec<Token>, // tokens of include/builtins.h
 }
 
 fn err(t: &Token, msg: &str) -> ! {
@@ -148,10 +149,18 @@ impl Preprocessor {
         for d in ["/usr/local/include", "/usr/include/x86_64-linux-gnu", "/usr/include"] {
             include_paths.push(d.to_string());
         }
-        let mut pp = Preprocessor { macros: HashMap::new(), conds: vec![], include_paths, once: HashSet::new(), pushed: HashMap::new(), counter: 0, depth: 0 };
+        let mut pp = Preprocessor { macros: HashMap::new(), conds: vec![], include_paths, once: HashSet::new(), pushed: HashMap::new(), counter: 0, depth: 0, prelude: vec![] };
         let mut inp = tokenize(PREDEFINED.as_bytes(), add_file("<built-in>"));
         inp.reverse();
         pp.process(&mut inp, &mut vec![]);
+        // Builtins written in C: their macros stay defined, their declarations
+        // are handed to the parser ahead of the translation unit.
+        let mut inp = tokenize(include_str!("../include/builtins.h").as_bytes(), add_file("<builtins>"));
+        inp.reverse();
+        let mut prelude = vec![];
+        pp.process(&mut inp, &mut prelude);
+        prelude.pop();
+        pp.prelude = prelude;
         pp
     }
 

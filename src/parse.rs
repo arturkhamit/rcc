@@ -43,12 +43,15 @@ pub enum NK {
     VlaAlloc { var: usize, size: Box<Node>, save: usize },
     VaStart(Box<Node>),
     StmtExpr(Vec<Node>),
+    LabelAddr(String), // GNU `&&label`
+    FrameAddr,         // %rbp, for __builtin_frame_address
     // Statements
     Return(Option<Box<Node>>),
     If(Box<Node>, Box<Node>, Option<Box<Node>>),
     For { init: Option<Box<Node>>, cond: Option<Box<Node>>, inc: Option<Box<Node>>, body: Box<Node>, brk: String, cont: String },
     Do { body: Box<Node>, cond: Box<Node>, brk: String, cont: String },
-    Switch { cond: Box<Node>, body: Box<Node>, cases: Vec<(i64, String)>, default: Option<String>, brk: String },
+    Switch { cond: Box<Node>, body: Box<Node>, cases: Vec<(i64, i64, String)>, default: Option<String>, brk: String }, // case lo ... hi
+    GotoExpr(Box<Node>), // GNU `goto *p`
     Label(String, Box<Node>),
     Goto(String),
     Block(Vec<Node>),
@@ -94,6 +97,7 @@ enum VS {
 struct Scope {
     vars: HashMap<String, VS>,
     tags: HashMap<String, Ty>,
+    labels: HashMap<String, String>, // GNU `__label__` block-local labels
 }
 
 #[derive(Default)]
@@ -106,10 +110,11 @@ struct Attr {
 
 #[derive(Default)]
 struct SwitchCtx {
-    cases: Vec<(i64, String)>,
+    cases: Vec<(i64, i64, String)>,
     default: Option<String>,
 }
 
+#[derive(Clone)]
 struct Init {
     ty: Ty,
     expr: Option<Node>,
@@ -400,6 +405,13 @@ fn eval2(n: &Node, mut label: Option<&mut String>) -> i64 {
             }
             0
         }
+        NK::LabelAddr(l) => {
+            match label.as_deref_mut() {
+                Some(out) => *out = l.clone(),
+                None => err(n.loc, "not a compile-time constant"),
+            }
+            0
+        }
         NK::Num(v) => *v,
         _ => err(n.loc, "not a compile-time constant"),
     };
@@ -583,6 +595,27 @@ impl Parser {
                 }
                 self.pos += 1;
             }
+        }
+    }
+    /// Assembly name of a user label (`__label__` declarations shadow function-wide ones).
+    fn user_label(&self, name: &str) -> String {
+        match self.scopes.iter().rev().find_map(|s| s.labels.get(name)) {
+            Some(l) => l.clone(),
+            None => format!(".L.u.{}.{}", self.fn_name, name),
+        }
+    }
+    fn static_assert(&mut self) {
+        let loc = self.loc();
+        self.pos += 1;
+        self.expect("(");
+        let ok = self.const_expr() != 0;
+        if self.consume(",") {
+            self.pos += 1; // the message
+        }
+        self.expect(")");
+        self.expect(";");
+        if !ok {
+            err(loc, "static assertion failed");
         }
     }
     fn is_asm(&self) -> bool {
@@ -977,6 +1010,10 @@ impl Parser {
 
         let mut members: Vec<Member> = Vec::new();
         while !self.consume("}") {
+            if self.is("_Static_assert") {
+                self.static_assert();
+                continue;
+            }
             let mut attr = Attr::default();
             let base = self.declspec(Some(&mut attr));
             if base.is_struct() && self.consume(";") {
@@ -1103,7 +1140,11 @@ impl Parser {
                 self.pos += 2;
                 continue;
             }
-            if self.is("_Static_assert") || self.is_asm() {
+            if self.is("_Static_assert") {
+                self.static_assert();
+                continue;
+            }
+            if self.is_asm() {
                 self.skip_to_semi();
                 continue;
             }
@@ -1285,17 +1326,31 @@ impl Parser {
         self.err("struct has no such member")
     }
 
+    /// `[i] = v` or GNU `[lo ... hi] = v`. Returns the index after the designated ones.
+    fn array_designator(&mut self, init: &mut Init) -> usize {
+        self.pos += 1;
+        let lo = self.const_expr() as usize;
+        let hi = if self.consume("...") { self.const_expr() as usize } else { lo };
+        self.expect("]");
+        if hi < lo {
+            self.err("empty index range in initializer");
+        }
+        self.ensure_child(init, hi);
+        self.designation(&mut init.children[lo]);
+        for k in lo + 1..=hi {
+            // shortcut: the value expression is duplicated, so its side effects repeat.
+            init.children[k] = init.children[lo].clone();
+        }
+        hi + 1
+    }
+
     fn designation(&mut self, init: &mut Init) {
         if self.is("[") {
             if !matches!(&*init.ty, Type::Array(..)) {
                 self.err("array index in non-array initializer");
             }
-            self.pos += 1;
-            let idx = self.const_expr() as usize;
-            self.expect("]");
-            self.ensure_child(init, idx);
-            self.designation(&mut init.children[idx]);
-            self.array_init2(init, idx + 1);
+            let next = self.array_designator(init);
+            self.array_init2(init, next);
             return;
         }
         if self.is(".") {
@@ -1326,12 +1381,7 @@ impl Parser {
             }
             first = false;
             if self.is("[") {
-                self.pos += 1;
-                let idx = self.const_expr() as usize;
-                self.expect("]");
-                self.ensure_child(init, idx);
-                self.designation(&mut init.children[idx]);
-                i = idx + 1;
+                i = self.array_designator(init);
                 continue;
             }
             if init.flexible || (i as i64) < len {
@@ -1646,7 +1696,18 @@ impl Parser {
                 self.err("expected '}'");
             }
             if self.is("_Static_assert") {
-                self.skip_to_semi();
+                self.static_assert();
+            } else if self.consume("__label__") {
+                loop {
+                    let name = self.ident();
+                    let l = format!(".L.u.{}.{}.{}", self.fn_name, name, self.uniq);
+                    self.uniq += 1;
+                    self.scope().labels.insert(name, l);
+                    if !self.consume(",") {
+                        break;
+                    }
+                }
+                self.expect(";");
             } else if self.is_typename() && !self.is_at(1, ":") {
                 let mut attr = Attr::default();
                 let base = self.declspec(Some(&mut attr));
@@ -1718,10 +1779,11 @@ impl Parser {
         }
         if self.consume("case") {
             let v = self.const_expr();
+            let hi = if self.consume("...") { self.const_expr() } else { v };
             self.expect(":");
             let l = self.label();
             let Some(sw) = self.switches.last_mut() else { err(loc, "stray case") };
-            sw.cases.push((v, l.clone()));
+            sw.cases.push((v, hi, l.clone()));
             return self.labeled(l, loc);
         }
         if self.consume("default") {
@@ -1773,9 +1835,14 @@ impl Parser {
             return mk(NK::Do { body, cond, brk, cont }, void, loc);
         }
         if self.consume("goto") {
+            if self.consume("*") {
+                let e = self.expr();
+                self.expect(";");
+                return mk(NK::GotoExpr(bx(e)), void, loc);
+            }
             let name = self.ident();
             self.expect(";");
-            return mk(NK::Goto(format!(".L.u.{}.{}", self.fn_name, name)), void, loc);
+            return mk(NK::Goto(self.user_label(&name)), void, loc);
         }
         if self.consume("break") {
             self.expect(";");
@@ -1790,7 +1857,8 @@ impl Parser {
         if self.tok().kind == TK::Ident && self.is_at(1, ":") {
             let name = self.ident();
             self.pos += 1;
-            return self.labeled(format!(".L.u.{}.{}", self.fn_name, name), loc);
+            self.skip_attrs();
+            return self.labeled(self.user_label(&name), loc);
         }
         if self.consume("{") {
             self.scopes.push(Scope::default());
@@ -1802,16 +1870,51 @@ impl Parser {
             return mk(NK::Nop, void, loc);
         }
         if self.is_asm() {
-            // Only the empty template (an optimization barrier) is accepted.
+            // Only the empty template (an optimization barrier) is accepted; its
+            // operands are evaluated for their side effects.
             self.pos += 1;
-            self.consume("volatile");
+            while self.consume("volatile") || self.consume("inline") || self.consume("__volatile__") {}
             self.expect("(");
-            if self.tok().kind != TK::Str || !self.tok().bytes.is_empty() || !self.is_at(1, ")") {
+            if self.tok().kind != TK::Str || !self.tok().bytes.is_empty() {
                 self.err("inline assembly is not supported");
             }
-            self.pos += 2;
+            self.pos += 1;
+            // Sections after the template: outputs, inputs, clobbers. An input whose
+            // constraint is a digit is tied to that output: with an empty template
+            // the statement then just copies it.
+            let (mut section, mut outs, mut out) = (0, Vec::<Node>::new(), vec![]);
+            while !self.consume(")") {
+                if self.consume(":") {
+                    section += 1;
+                    continue;
+                }
+                if self.consume(",") {
+                    continue;
+                }
+                if self.consume("[") {
+                    self.pos += 1;
+                    self.expect("]");
+                }
+                if self.tok().kind != TK::Str {
+                    self.err("invalid asm operand");
+                }
+                let tied = String::from_utf8_lossy(&self.tok().bytes).parse::<usize>().ok();
+                self.pos += 1;
+                if self.consume("(") {
+                    let e = self.expr();
+                    self.expect(")");
+                    let e = match tied.filter(|i| section == 2 && *i < outs.len()) {
+                        Some(i) => new_assign(outs[i].clone(), e, loc),
+                        None => e,
+                    };
+                    if section == 1 {
+                        outs.push(e.clone());
+                    }
+                    out.push(mk(NK::ExprStmt(bx(mk(NK::Cast(bx(e)), void.clone(), loc))), void.clone(), loc));
+                }
+            }
             self.expect(";");
-            return mk(NK::Nop, void, loc);
+            return mk(NK::Block(out), void, loc);
         }
         let e = self.expr();
         self.expect(";");
@@ -1985,6 +2088,10 @@ impl Parser {
                 err(loc, "cannot take address of bitfield");
             }
             return new_addr(e, loc);
+        }
+        if self.consume("&&") {
+            let name = self.ident();
+            return mk(NK::LabelAddr(self.user_label(&name)), ptr_to(ty_void()), loc);
         }
         if self.consume("*") {
             let e = self.cast();
@@ -2209,6 +2316,28 @@ impl Parser {
             self.expect(")");
             return n;
         }
+        if self.consume("_Generic") {
+            // shortcut: qualifiers are not part of rcc's types and `long`/`long long`
+            // (and `char`/`signed char`) are one type, so the first such association wins.
+            self.expect("(");
+            let ctrl = decay(&self.assign().ty);
+            let (mut chosen, mut dflt) = (None, None);
+            while !self.consume(")") {
+                self.expect(",");
+                if self.consume("default") {
+                    self.expect(":");
+                    dflt = Some(self.assign());
+                    continue;
+                }
+                let ty = self.typename();
+                self.expect(":");
+                let e = self.assign();
+                if chosen.is_none() && same_type(&ctrl, &ty) {
+                    chosen = Some(e);
+                }
+            }
+            return chosen.or(dflt).unwrap_or_else(|| err(loc, "_Generic selector matches no association"));
+        }
         let t = self.tok().clone();
         match t.kind {
             TK::Num => {
@@ -2244,13 +2373,65 @@ impl Parser {
                         self.expect(")");
                         return mk(NK::Cast(bx(ap)), ty_void(), loc);
                     }
-                    "__builtin_constant_p" | "__builtin_prefetch" => {
+                    "__builtin_prefetch" => {
                         self.expect("(");
+                        let mut e = mk(NK::Cast(bx(self.assign())), ty_void(), loc);
                         while !self.consume(")") {
-                            self.assign();
-                            self.consume(",");
+                            self.expect(",");
+                            e = new_comma(e, mk(NK::Cast(bx(self.assign())), ty_void(), loc), loc);
                         }
-                        return num(0, loc);
+                        return e;
+                    }
+                    "__builtin_constant_p" => {
+                        self.expect("(");
+                        let e = self.expr();
+                        self.expect(")");
+                        return num(is_const(&e) as i64, loc);
+                    }
+                    "__builtin_choose_expr" => {
+                        self.expect("(");
+                        let c = self.const_expr();
+                        self.expect(",");
+                        let a = self.assign();
+                        self.expect(",");
+                        let b = self.assign();
+                        self.expect(")");
+                        return if c != 0 { a } else { b };
+                    }
+                    "__builtin_types_compatible_p" => {
+                        self.expect("(");
+                        let a = self.typename();
+                        self.expect(",");
+                        let b = self.typename();
+                        self.expect(")");
+                        return num(same_type(&a, &b) as i64, loc);
+                    }
+                    "__builtin_classify_type" => {
+                        self.expect("(");
+                        let ty = if self.is_typename() { self.typename() } else { self.expr().ty };
+                        self.expect(")");
+                        let class = match &*ty {
+                            Type::Void => 0,
+                            Type::Struct(sd) => if sd.borrow().is_union { 13 } else { 12 },
+                            t if t.is_integer() => 1,
+                            t if t.is_flonum() => 8,
+                            _ => 5,
+                        };
+                        return num(class, loc);
+                    }
+                    "__builtin_frame_address" | "__builtin_return_address" => {
+                        self.expect("(");
+                        let level = self.const_expr();
+                        self.expect(")");
+                        let pp = ptr_to(ptr_to(ty_void()));
+                        let mut fp = mk(NK::FrameAddr, pp.clone(), loc);
+                        for _ in 0..level {
+                            fp = mk(NK::Cast(bx(new_deref(fp, loc))), pp.clone(), loc);
+                        }
+                        if t.s == "__builtin_frame_address" {
+                            return mk(NK::Cast(bx(fp)), ptr_to(ty_void()), loc);
+                        }
+                        return new_deref(new_add(fp, num(1, loc), loc), loc);
                     }
                     "__builtin_va_copy" => {
                         self.expect("(");
@@ -2271,9 +2452,15 @@ impl Parser {
                         self.expect("(");
                         let e = self.assign();
                         self.expect(",");
-                        self.assign();
+                        let v = self.assign();
                         self.expect(")");
-                        return e;
+                        if is_const(&v) || e.ty.is_struct() {
+                            return e;
+                        }
+                        // The hint may have side effects: tmp = e, v, tmp
+                        let tmp = self.new_lvar("", e.ty.clone());
+                        let set = new_assign(self.lvar(tmp, loc), e, loc);
+                        return new_comma(set, new_comma(v, self.lvar(tmp, loc), loc), loc);
                     }
                     "__builtin_offsetof" => {
                         self.expect("(");
@@ -2310,12 +2497,22 @@ impl Parser {
                                 t.s.as_str()
                             }
                         };
+                        if let Some(VS::Global(i)) = self.find_var(name).cloned() {
+                            return self.gvar(i, loc); // `__builtin_foo` with `foo` declared
+                        }
+                        const MATH: &[&str] = &[
+                            "fabs", "sqrt", "floor", "ceil", "pow", "sin", "cos", "tan", "exp", "log", "log2", "log10", "copysign",
+                            "fmod", "trunc", "round", "rint", "nearbyint", "ldexp", "scalbn", "frexp", "modf", "fmin", "fmax", "atan",
+                            "atan2", "asin", "acos", "sinh", "cosh", "tanh", "hypot", "cbrt", "exp2", "expm1", "log1p",
+                        ];
                         let ret = match name {
                             "memset" | "memcpy" | "memmove" | "memchr" | "malloc" | "calloc" | "realloc" | "strcpy" | "strncpy"
-                            | "strcat" | "strncat" | "strchr" | "strrchr" | "strstr" => ptr_to(ty_char()),
-                            "strlen" => ty_ulong(),
+                            | "strcat" | "strncat" | "strchr" | "strrchr" | "strstr" | "stpcpy" | "mempcpy" | "strdup" => ptr_to(ty_char()),
+                            "strlen" | "strspn" | "strcspn" => ty_ulong(),
+                            "labs" | "llabs" => ty_long(),
                             "abort" | "exit" | "free" => ty_void(),
-                            "fabs" | "sqrt" | "floor" | "ceil" | "pow" | "sin" | "cos" | "exp" | "log" | "inf" | "huge_val" | "nan" | "copysign" | "fmod" => ty_double(),
+                            _ if MATH.contains(&name) => ty_double(),
+                            _ if name.strip_suffix('f').is_some_and(|b| MATH.contains(&b)) => ty_float(),
                             _ => ty_int(),
                         };
                         let fty = Rc::new(Type::Func(Rc::new(FuncTy { ret, params: vec![], names: vec![], variadic: false, oldstyle: true })));

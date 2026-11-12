@@ -24,7 +24,8 @@ struct Opts {
     defines: Vec<(bool, String)>, // (is -D, argument)
 }
 
-fn preprocess(path: &str, opts: &Opts) -> Vec<lex::Token> {
+/// Returns the tokens of the builtin prelude and of the translation unit.
+fn preprocess(path: &str, opts: &Opts) -> (Vec<lex::Token>, Vec<lex::Token>) {
     let mut pp = preprocess::Preprocessor::new(opts.include_paths.clone());
     for (def, arg) in &opts.defines {
         match (def, arg.split_once('=')) {
@@ -33,11 +34,14 @@ fn preprocess(path: &str, opts: &Opts) -> Vec<lex::Token> {
             (true, None) => pp.define(arg, "1"),
         }
     }
-    pp.run(path)
+    let toks = pp.run(path);
+    (pp.prelude, toks)
 }
 
 fn compile(path: &str, opts: &Opts) -> String {
-    let toks = lex::convert(preprocess(path, opts));
+    let (mut toks, unit) = preprocess(path, opts);
+    toks.extend(unit);
+    let toks = lex::convert(toks);
     let globals = parse::parse(toks);
     codegen::codegen(&globals)
 }
@@ -95,7 +99,7 @@ fn main() {
             continue;
         }
         if opt_e {
-            let text = preprocess::to_text(&preprocess(input, &opts));
+            let text = preprocess::to_text(&preprocess(input, &opts).1);
             match &out {
                 Some(o) => std::fs::write(o, text + "\n").unwrap_or_else(|e| die(&format!("{}: {}", o, e))),
                 None => println!("{}", text),

@@ -162,3 +162,19 @@ pub fn find_member(ty: &Ty, name: &str) -> Option<Vec<Member>> {
     }
     None
 }
+
+/// Type compatibility for `_Generic` and `__builtin_types_compatible_p`.
+pub fn same_type(a: &Ty, b: &Ty) -> bool {
+    match (&**a, &**b) {
+        (Type::Void, Type::Void) | (Type::Bool, Type::Bool) | (Type::Float, Type::Float) | (Type::Double, Type::Double) => true,
+        (Type::Int { size: s1, unsigned: u1 }, Type::Int { size: s2, unsigned: u2 }) => s1 == s2 && u1 == u2,
+        (Type::Ptr(x), Type::Ptr(y)) => same_type(x, y),
+        (Type::Array(x, n), Type::Array(y, m)) => (n == m || *n < 0 || *m < 0) && same_type(x, y),
+        (Type::Func(f), Type::Func(g)) => {
+            same_type(&f.ret, &g.ret)
+                && (f.oldstyle || g.oldstyle || f.variadic == g.variadic && f.params.len() == g.params.len() && f.params.iter().zip(&g.params).all(|(x, y)| same_type(x, y)))
+        }
+        (Type::Struct(x), Type::Struct(y)) => Rc::ptr_eq(x, y),
+        _ => false,
+    }
+}
