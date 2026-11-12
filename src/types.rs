@@ -8,9 +8,8 @@ pub enum Type {
     Bool,
     Int { size: u8, unsigned: bool },
     Float,
-    // shortcut: `long double` is parsed as Double (8 bytes), not x87 80-bit;
-    // upgrade if libc long-double functions (printf %Lf, strtold) must work.
     Double,
+    LDouble, // x87 80-bit extended precision, 16 bytes in memory
     Ptr(Ty),
     Array(Ty, i64), // len < 0: incomplete
     Vla(Ty, usize), // variable-length array; the local holding its byte size
@@ -50,6 +49,7 @@ impl Type {
             Type::Int { size, .. } => *size as i64,
             Type::Float => 4,
             Type::Double | Type::Ptr(_) | Type::Vla(..) => 8, // a VLA variable is a pointer to its storage
+            Type::LDouble => 16,
             Type::Array(b, n) => if *n < 0 { 0 } else { b.size() * n },
             Type::Struct(s) => s.borrow().size,
         }
@@ -65,7 +65,7 @@ impl Type {
         matches!(self, Type::Bool | Type::Int { .. })
     }
     pub fn is_flonum(&self) -> bool {
-        matches!(self, Type::Float | Type::Double)
+        matches!(self, Type::Float | Type::Double | Type::LDouble)
     }
     pub fn is_numeric(&self) -> bool {
         self.is_integer() || self.is_flonum()
@@ -96,6 +96,7 @@ pub fn ty_long() -> Ty { ty_ints(8, false) }
 pub fn ty_ulong() -> Ty { ty_ints(8, true) }
 pub fn ty_float() -> Ty { Rc::new(Type::Float) }
 pub fn ty_double() -> Ty { Rc::new(Type::Double) }
+pub fn ty_ldouble() -> Ty { Rc::new(Type::LDouble) }
 pub fn ptr_to(b: Ty) -> Ty { Rc::new(Type::Ptr(b)) }
 pub fn array_of(b: Ty, n: i64) -> Ty { Rc::new(Type::Array(b, n)) }
 pub fn new_struct(is_union: bool) -> Ty {
@@ -132,6 +133,9 @@ pub fn common_type(a: &Ty, b: &Ty) -> Ty {
     if b.base().is_some() || matches!(**b, Type::Func(_)) {
         return decay(b);
     }
+    if matches!(**a, Type::LDouble) || matches!(**b, Type::LDouble) {
+        return ty_ldouble();
+    }
     if matches!(**a, Type::Double) || matches!(**b, Type::Double) {
         return ty_double();
     }
@@ -166,7 +170,7 @@ pub fn find_member(ty: &Ty, name: &str) -> Option<Vec<Member>> {
 /// Type compatibility for `_Generic` and `__builtin_types_compatible_p`.
 pub fn same_type(a: &Ty, b: &Ty) -> bool {
     match (&**a, &**b) {
-        (Type::Void, Type::Void) | (Type::Bool, Type::Bool) | (Type::Float, Type::Float) | (Type::Double, Type::Double) => true,
+        (Type::Void, Type::Void) | (Type::Bool, Type::Bool) | (Type::Float, Type::Float) | (Type::Double, Type::Double) | (Type::LDouble, Type::LDouble) => true,
         (Type::Int { size: s1, unsigned: u1 }, Type::Int { size: s2, unsigned: u2 }) => s1 == s2 && u1 == u2,
         (Type::Ptr(x), Type::Ptr(y)) => same_type(x, y),
         (Type::Array(x, n), Type::Array(y, m)) => (n == m || *n < 0 || *m < 0) && same_type(x, y),
@@ -177,4 +181,43 @@ pub fn same_type(a: &Ty, b: &Ty) -> bool {
         (Type::Struct(x), Type::Struct(y)) => Rc::ptr_eq(x, y),
         _ => false,
     }
+}
+
+/// True if the type contains a `long double` (such structs are passed in memory).
+pub fn has_ldouble(ty: &Ty) -> bool {
+    match &**ty {
+        Type::LDouble => true,
+        Type::Array(b, _) => has_ldouble(b),
+        Type::Struct(s) => s.borrow().members.iter().any(|m| has_ldouble(&m.ty)),
+        _ => false,
+    }
+}
+
+/// Converts a double to the x87 extended format: (mantissa, sign and exponent).
+pub fn f64_to_f80(v: f64) -> (u64, u16) {
+    let bits = v.to_bits();
+    let sign = ((bits >> 63) as u16) << 15;
+    let (exp, frac) = (((bits >> 52) & 0x7ff) as i32, bits & ((1 << 52) - 1));
+    match (exp, frac) {
+        (0, 0) => (0, sign),
+        (0x7ff, 0) => (1 << 63, sign | 0x7fff),
+        (0x7ff, _) => (3 << 62 | frac << 11, sign | 0x7fff),
+        (0, _) => {
+            let lz = frac.leading_zeros() as i32;
+            (frac << lz, sign | (16383 - 1074 + 63 - lz) as u16)
+        }
+        _ => (1 << 63 | frac << 11, sign | (exp - 1023 + 16383) as u16),
+    }
+}
+
+/// Approximates an x87 extended value by a double.
+pub fn f80_to_f64(m: u64, se: u16) -> f64 {
+    let e = (se & 0x7fff) as i32;
+    let v = if e == 0x7fff {
+        if m << 1 == 0 { f64::INFINITY } else { f64::NAN }
+    } else {
+        let e = e.max(1) - 16383 - 63;
+        m as f64 * 2f64.powi(e / 2) * 2f64.powi(e - e / 2)
+    };
+    if se >> 15 != 0 { -v } else { v }
 }

@@ -25,7 +25,7 @@ pub fn error_at(file: u32, line: u32, msg: &str) -> ! {
 pub enum TK { Ident, Punct, Keyword, Str, Num, PPNum, Eof }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
-pub enum NumTy { Int, UInt, Long, ULong, Float, Double }
+pub enum NumTy { Int, UInt, Long, ULong, Float, Double, LDouble }
 
 #[derive(Clone, Debug)]
 pub struct Token {
@@ -37,6 +37,7 @@ pub struct Token {
     pub space: bool,    // preceded by whitespace
     pub ival: i64,      // Num: value; Str: element size (1 or 4)
     pub fval: f64,
+    pub lexp: u16, // long double constants: sign and exponent (the mantissa is in `ival`)
     pub nty: NumTy,
     pub bytes: Vec<u8>, // Str: decoded contents without the trailing NUL
     pub hide: Vec<std::rc::Rc<str>>, // preprocessor hideset
@@ -44,7 +45,7 @@ pub struct Token {
 
 impl Token {
     pub fn new(kind: TK, s: &str, file: u32, line: u32) -> Token {
-        Token { kind, s: s.to_string(), file, line, bol: false, space: false, ival: 0, fval: 0.0, nty: NumTy::Int, bytes: vec![], hide: vec![] }
+        Token { kind, s: s.to_string(), file, line, bol: false, space: false, ival: 0, fval: 0.0, lexp: 0, nty: NumTy::Int, bytes: vec![], hide: vec![] }
     }
     pub fn is(&self, s: &str) -> bool {
         (self.kind == TK::Punct || self.kind == TK::Keyword) && self.s == s
@@ -337,11 +338,93 @@ fn convert_number(t: &mut Token) {
     t.ival = v as i64;
 }
 
+/// Parses a floating constant (without suffix) exactly into the x87 extended
+/// format, using a small bignum: value = big * 2^exp2.
+fn parse_f80(body: &str) -> (u64, u16) {
+    fn mul_add(big: &mut Vec<u32>, m: u32, add: u32) {
+        let mut carry = add as u64;
+        for w in big.iter_mut() {
+            let v = *w as u64 * m as u64 + carry;
+            *w = v as u32;
+            carry = v >> 32;
+        }
+        if carry != 0 {
+            big.push(carry as u32);
+        }
+    }
+    let (mut big, mut exp2, mut sticky): (Vec<u32>, i64, bool) = (vec![], 0, false);
+    if let Some(hex) = body.strip_prefix("0x") {
+        let (mant, exp) = hex.split_once('p').unwrap_or((hex, "0"));
+        let (ip, fp) = mant.split_once('.').unwrap_or((mant, ""));
+        for c in ip.chars().chain(fp.chars()) {
+            mul_add(&mut big, 16, c.to_digit(16).unwrap_or(0));
+        }
+        exp2 = exp.parse::<i64>().unwrap_or(0) - 4 * fp.len() as i64;
+    } else {
+        let (mant, exp) = body.split_once('e').unwrap_or((body, "0"));
+        let (ip, fp) = mant.split_once('.').unwrap_or((mant, ""));
+        for c in ip.chars().chain(fp.chars()) {
+            mul_add(&mut big, 10, c.to_digit(10).unwrap_or(0));
+        }
+        let exp10 = exp.parse::<i64>().unwrap_or(0).clamp(-6000, 6000) - fp.len() as i64;
+        for _ in 0..exp10.max(0) {
+            mul_add(&mut big, 10, 0);
+        }
+        if exp10 < 0 {
+            // Scale up by 2^k, then divide by 10^n; k leaves about 80 spare bits.
+            let n = -exp10;
+            let words = (n * 4 + 96) / 32;
+            big.splice(0..0, std::iter::repeat_n(0u32, words as usize));
+            exp2 = -32 * words;
+            for _ in 0..n {
+                let mut rem = 0u64;
+                for w in big.iter_mut().rev() {
+                    let v = rem << 32 | *w as u64;
+                    *w = (v / 10) as u32;
+                    rem = v % 10;
+                }
+                sticky |= rem != 0;
+            }
+        }
+    }
+    while big.last() == Some(&0) {
+        big.pop();
+    }
+    if big.is_empty() {
+        return (0, 0);
+    }
+    // The top 64 bits, rounded to nearest even.
+    let len = big.len() as i64 * 32 - big.last().unwrap().leading_zeros() as i64;
+    let bit = |i: i64| i >= 0 && big[(i / 32) as usize] >> (i % 32) & 1 != 0;
+    let mut m = 0u64;
+    for i in 0..64 {
+        m = m << 1 | bit(len - 1 - i) as u64;
+    }
+    sticky |= (0..len - 65).any(bit);
+    let mut e = exp2 + len - 64;
+    if bit(len - 65) && (sticky || m & 1 != 0) {
+        m = m.wrapping_add(1);
+        if m == 0 {
+            m = 1 << 63;
+            e += 1;
+        }
+    }
+    let biased = e + 63 + 16383;
+    if biased >= 0x7fff {
+        return (1 << 63, 0x7fff);
+    }
+    if biased <= 0 {
+        // Denormal (not rounded again).
+        return (if biased > -63 { m >> (1 - biased) } else { 0 }, 0);
+    }
+    (m, biased as u16)
+}
+
 fn convert_float(t: &mut Token, s: &str) {
     let (body, nty) = if let Some(b) = s.strip_suffix('f').filter(|_| !s.starts_with("0x")) {
         (b, NumTy::Float)
     } else if let Some(b) = s.strip_suffix('l') {
-        (b, NumTy::Double)
+        (b, NumTy::LDouble)
     } else {
         (s, NumTy::Double)
     };
@@ -368,6 +451,11 @@ fn convert_float(t: &mut Token, s: &str) {
     t.kind = TK::Num;
     t.nty = nty;
     t.fval = if nty == NumTy::Float { v as f32 as f64 } else { v };
+    if nty == NumTy::LDouble {
+        let (m, e) = parse_f80(body);
+        t.ival = m as i64;
+        t.lexp = e;
+    }
 }
 
 /// Converts preprocessing tokens to parser tokens: keywords, numbers, and

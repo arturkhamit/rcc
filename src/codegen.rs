@@ -29,8 +29,9 @@ pub fn has_flonum(ty: &Ty, lo: i64, hi: i64, off: i64) -> bool {
 /// updating the counts of used general-purpose and SSE registers.
 fn in_regs(ty: &Ty, gp: &mut usize, fp: &mut usize) -> bool {
     let (ng, nf) = match &**ty {
+        Type::LDouble => return false,
         Type::Struct(_) => {
-            if ty.size() > 16 {
+            if ty.size() > 16 || has_ldouble(ty) {
                 return false;
             }
             let f1 = has_flonum(ty, 0, 8, 0) as usize;
@@ -126,6 +127,23 @@ impl<'a> Gen<'a> {
         self.depth -= 1;
     }
 
+    fn pushld(&mut self) {
+        emit!(self, "  sub $16, %rsp\n  fstpt (%rsp)");
+        self.depth += 2;
+    }
+    fn popld(&mut self) {
+        emit!(self, "  fldt (%rsp)\n  add $16, %rsp");
+        self.depth -= 2;
+    }
+    /// Evaluates an expression whose value is not used. A long double must be
+    /// popped: the x87 register stack holds only eight values.
+    fn gen_void(&mut self, n: &Node) {
+        self.gen_expr(n);
+        if let Type::LDouble = *n.ty {
+            emit!(self, "  fstp %st(0)");
+        }
+    }
+
     fn emit_data(&mut self, o: &Obj) {
         let size = o.ty.size();
         let align = if matches!(&*o.ty, Type::Array(..)) && size >= 16 { o.ty.align().max(16) } else { o.ty.align() };
@@ -173,6 +191,9 @@ impl<'a> Gen<'a> {
             let ty = &f.locals[p].ty;
             if !in_regs(ty, &mut gp, &mut fp) {
                 on_stack[p] = true;
+                if ty.align() >= 16 {
+                    top = align_to(top, 16);
+                }
                 self.offs[p] = top;
                 top += align_to(ty.size(), 8);
             }
@@ -290,7 +311,7 @@ impl<'a> Gen<'a> {
             }
             NK::Deref(l) => self.gen_expr(l),
             NK::Comma(l, r) => {
-                self.gen_expr(l);
+                self.gen_void(l);
                 self.gen_addr(r);
             }
             NK::Member(l, m) => {
@@ -318,6 +339,7 @@ impl<'a> Gen<'a> {
             }
             Type::Float => emit!(self, "  movss {}, %xmm0", src),
             Type::Double => emit!(self, "  movsd {}, %xmm0", src),
+            Type::LDouble => emit!(self, "  fldt {}", src),
             Type::Bool => emit!(self, "  movzbl {}, %eax", src),
             Type::Int { size: 1, unsigned } => emit!(self, "  mov{}bl {}, %eax", if *unsigned { 'z' } else { 's' }, src),
             Type::Int { size: 2, unsigned } => emit!(self, "  mov{}wl {}, %eax", if *unsigned { 'z' } else { 's' }, src),
@@ -342,6 +364,7 @@ impl<'a> Gen<'a> {
             }
             Type::Float => emit!(self, "  movss %xmm0, {}", dst),
             Type::Double => emit!(self, "  movsd %xmm0, {}", dst),
+            Type::LDouble => emit!(self, "  fld %st(0)\n  fstpt {}", dst), // the value stays on the x87 stack
             _ => match ty.size() {
                 1 => emit!(self, "  mov %al, {}", dst),
                 2 => emit!(self, "  mov %ax, {}", dst),
@@ -365,8 +388,13 @@ impl<'a> Gen<'a> {
         match &**ty {
             Type::Float => emit!(self, "  xorps %xmm1, %xmm1\n  ucomiss %xmm1, %xmm0"),
             Type::Double => emit!(self, "  xorpd %xmm1, %xmm1\n  ucomisd %xmm1, %xmm0"),
+            Type::LDouble => emit!(self, "  fldz\n  fucomip %st(1), %st\n  fstp %st(0)"),
             _ if ty.is_integer() && ty.size() <= 4 => emit!(self, "  cmp $0, %eax"),
             _ => emit!(self, "  cmp $0, %rax"),
+        }
+        if ty.is_flonum() {
+            // A NaN compares unordered but is not zero.
+            emit!(self, "  setne %al\n  setp %dl\n  or %dl, %al\n  test %al, %al");
         }
     }
 
@@ -382,6 +410,9 @@ impl<'a> Gen<'a> {
 
     fn cast(&mut self, from: &Ty, to: &Ty) {
         use Type::*;
+        if let (LDouble, Void) = (&**from, &**to) {
+            emit!(self, "  fstp %st(0)");
+        }
         if matches!(**to, Void | Struct(_)) || matches!(**from, Struct(_) | Void) {
             return;
         }
@@ -391,9 +422,37 @@ impl<'a> Gen<'a> {
             return;
         }
         match (&**from, &**to) {
-            (Float, Float) | (Double, Double) => {}
+            (Float, Float) | (Double, Double) | (LDouble, LDouble) => {}
             (Float, Double) => emit!(self, "  cvtss2sd %xmm0, %xmm0"),
             (Double, Float) => emit!(self, "  cvtsd2ss %xmm0, %xmm0"),
+            // x87 conversions go through the red zone below %rsp.
+            (Float, LDouble) => emit!(self, "  movss %xmm0, -4(%rsp)\n  flds -4(%rsp)"),
+            (Double, LDouble) => emit!(self, "  movsd %xmm0, -8(%rsp)\n  fldl -8(%rsp)"),
+            (LDouble, Float) => emit!(self, "  fstps -4(%rsp)\n  movss -4(%rsp), %xmm0"),
+            (LDouble, Double) => emit!(self, "  fstpl -8(%rsp)\n  movsd -8(%rsp), %xmm0"),
+            (LDouble, t) => {
+                let (size, unsigned) = int_info(t);
+                if size == 8 && unsigned {
+                    // Values >= 2^63: subtract 2^63, convert, set the top bit.
+                    emit!(self, "  movl $0x5f000000, -12(%rsp)\n  flds -12(%rsp)\n  fucomip %st(1), %st\n  ja 1f");
+                    emit!(self, "  fsubs -12(%rsp)\n  fisttpq -8(%rsp)\n  mov -8(%rsp), %rax\n  btc $63, %rax\n  jmp 2f");
+                    emit!(self, "1:\n  fisttpq -8(%rsp)\n  mov -8(%rsp), %rax\n2:");
+                } else {
+                    emit!(self, "  fisttpq -8(%rsp)\n  mov -8(%rsp), %rax");
+                    self.trunc(size, unsigned);
+                }
+            }
+            (f, LDouble) => {
+                let (size, unsigned) = int_info(f);
+                if size < 8 {
+                    emit!(self, "  {}", if unsigned { "mov %eax, %eax" } else { "movslq %eax, %rax" });
+                }
+                emit!(self, "  mov %rax, -8(%rsp)\n  fildq -8(%rsp)");
+                if size == 8 && unsigned {
+                    // fildq is signed: add 2^64 back.
+                    emit!(self, "  test %rax, %rax\n  jns 1f\n  movl $0x5f800000, -4(%rsp)\n  fadds -4(%rsp)\n1:");
+                }
+            }
             (Float | Double, t) => {
                 let (size, unsigned) = int_info(t);
                 if let Float = **from {
@@ -448,9 +507,11 @@ impl<'a> Gen<'a> {
                 Type::Float => emit!(self, "  mov ${}, %eax\n  movd %eax, %xmm0", (*v as f32).to_bits()),
                 _ => emit!(self, "  mov ${}, %rax\n  movq %rax, %xmm0", v.to_bits() as i64),
             },
+            NK::LNum(m, se) => emit!(self, "  mov ${}, %rax\n  mov %rax, -16(%rsp)\n  movw ${}, -8(%rsp)\n  fldt -16(%rsp)", *m as i64, se),
             NK::Neg(l) => {
                 self.gen_expr(l);
                 match &*n.ty {
+                    Type::LDouble => emit!(self, "  fchs"),
                     Type::Float => emit!(self, "  mov $1, %eax\n  shl $31, %eax\n  movd %eax, %xmm1\n  xorps %xmm1, %xmm0"),
                     Type::Double => emit!(self, "  mov $1, %eax\n  shl $63, %rax\n  movq %rax, %xmm1\n  xorpd %xmm1, %xmm0"),
                     _ => emit!(self, "  neg %rax"),
@@ -556,12 +617,16 @@ impl<'a> Gen<'a> {
                 self.cast(&l.ty, &n.ty);
             }
             NK::Comma(l, r) => {
-                self.gen_expr(l);
+                self.gen_void(l);
                 self.gen_expr(r);
             }
             NK::StmtExpr(stmts) => {
-                for s in stmts {
-                    self.gen_stmt(s);
+                for (i, s) in stmts.iter().enumerate() {
+                    match &s.kind {
+                        // The last expression is the value: keep it.
+                        NK::ExprStmt(e) if i + 1 == stmts.len() => self.gen_expr(e),
+                        _ => self.gen_stmt(s),
+                    }
                 }
             }
             NK::VaStart(ap) => {
@@ -589,18 +654,28 @@ impl<'a> Gen<'a> {
 
     fn gen_bin(&mut self, op: Op, l: &Node, r: &Node) {
         if l.ty.is_flonum() {
+            // Long double: %st(0) = right operand, %st(1) = left operand.
+            let ld = matches!(*l.ty, Type::LDouble);
             self.gen_expr(r);
-            self.pushf();
+            if ld { self.pushld() } else { self.pushf() }
             self.gen_expr(l);
-            self.popf(1);
+            if ld { self.popld() } else { self.popf(1) }
             let s = if let Type::Float = *l.ty { "ss" } else { "sd" };
             match op {
+                Op::Add if ld => emit!(self, "  faddp"),
+                Op::Sub if ld => emit!(self, "  fsubrp"),
+                Op::Mul if ld => emit!(self, "  fmulp"),
+                Op::Div if ld => emit!(self, "  fdivrp"),
                 Op::Add => emit!(self, "  add{} %xmm1, %xmm0", s),
                 Op::Sub => emit!(self, "  sub{} %xmm1, %xmm0", s),
                 Op::Mul => emit!(self, "  mul{} %xmm1, %xmm0", s),
                 Op::Div => emit!(self, "  div{} %xmm1, %xmm0", s),
                 Op::Eq | Op::Ne | Op::Lt | Op::Le => {
-                    emit!(self, "  ucomi{} %xmm0, %xmm1", s);
+                    if ld {
+                        emit!(self, "  fucomip %st(1), %st\n  fstp %st(0)");
+                    } else {
+                        emit!(self, "  ucomi{} %xmm0, %xmm1", s);
+                    }
                     match op {
                         Op::Eq => emit!(self, "  sete %al\n  setnp %dl\n  and %dl, %al"),
                         Op::Ne => emit!(self, "  setne %al\n  setp %dl\n  or %dl, %al"),
@@ -663,7 +738,16 @@ impl<'a> Gen<'a> {
                 emit!(self, "  mov %rax, %rsi\n  mov %rsp, %rdi\n  mov ${}, %ecx\n  rep movsb", a.ty.size());
             }
             Type::Float | Type::Double => self.pushf(),
+            Type::LDouble => self.pushld(),
             _ => self.push(),
+        }
+    }
+
+    /// Size of an argument passed on the stack.
+    fn stack_size(ty: &Ty) -> i64 {
+        match &**ty {
+            Type::Struct(_) | Type::LDouble => align_to(ty.size(), 8),
+            _ => 8,
         }
     }
 
@@ -672,17 +756,35 @@ impl<'a> Gen<'a> {
         let ret_mem = ret.is_struct() && ret.size() > 16;
         let (mut gp, mut fp) = (ret_mem as usize, 0);
         let on_stack: Vec<bool> = args.iter().map(|a| !in_regs(&a.ty, &mut gp, &mut fp)).collect();
-        let mut slots: i64 = args.iter().zip(&on_stack).filter(|(_, s)| **s).map(|(a, _)| if a.ty.is_struct() { align_to(a.ty.size(), 8) / 8 } else { 1 }).sum();
+        // Offsets of the stack arguments from %rsp at the call; long doubles and
+        // structs containing them are 16-byte aligned.
+        let (mut arg_offs, mut total) = (vec![0i64; args.len()], 0i64);
+        for (i, a) in args.iter().enumerate().filter(|(i, _)| on_stack[*i]) {
+            if matches!(&*a.ty, Type::Struct(_) | Type::LDouble) && a.ty.align() >= 16 {
+                total = align_to(total, 16);
+            }
+            arg_offs[i] = total;
+            total += Self::stack_size(&a.ty);
+        }
+        let mut slots = total / 8;
         if (self.depth + slots) % 2 == 1 {
             emit!(self, "  sub $8, %rsp");
             self.depth += 1;
             slots += 1;
         }
-        // Stack arguments first (in reverse), then register arguments.
-        for pass in [true, false] {
-            for (a, _) in args.iter().zip(&on_stack).rev().filter(|(_, s)| **s == pass) {
-                self.push_arg(a);
+        // Stack arguments first (in reverse, with padding), then register arguments.
+        let mut end = total;
+        for (i, a) in args.iter().enumerate().rev().filter(|(i, _)| on_stack[*i]) {
+            let pad = end - arg_offs[i] - Self::stack_size(&a.ty);
+            if pad > 0 {
+                emit!(self, "  sub ${}, %rsp", pad);
+                self.depth += pad / 8;
             }
+            self.push_arg(a);
+            end = arg_offs[i];
+        }
+        for (a, _) in args.iter().zip(&on_stack).rev().filter(|(_, s)| !**s) {
+            self.push_arg(a);
         }
         let direct = match &f.kind {
             NK::GVar(name) if matches!(*f.ty, Type::Func(_)) => Some(name),
@@ -735,6 +837,11 @@ impl<'a> Gen<'a> {
         match &**ret {
             Type::Bool => emit!(self, "  movzbl %al, %eax"),
             Type::Int { size, unsigned } => self.trunc(*size as i64, *unsigned),
+            Type::Struct(_) if !ret_mem && has_ldouble(ret) => {
+                // struct { long double } comes back in %st(0).
+                let off = self.offs[ret_buf.unwrap()];
+                emit!(self, "  fstpt {}(%rbp)\n  lea {}(%rbp), %rax", off, off);
+            }
             Type::Struct(_) if !ret_mem => {
                 // Small structs come back in rax/rdx/xmm0/xmm1.
                 let (off, size) = (self.offs[ret_buf.unwrap()], ret.size());
@@ -776,6 +883,8 @@ impl<'a> Gen<'a> {
                             // Copy to the caller's buffer and return its address.
                             let off = self.offs[f.params[0]];
                             emit!(self, "  mov %rax, %rsi\n  mov {}(%rbp), %rdi\n  mov ${}, %ecx\n  rep movsb\n  mov {}(%rbp), %rax", off, size, off);
+                        } else if has_ldouble(&e.ty) {
+                            emit!(self, "  fldt (%rax)");
                         } else {
                             emit!(self, "  mov %rax, %rdi");
                             let (mut gp, mut fp) = (0, 0);
@@ -827,7 +936,7 @@ impl<'a> Gen<'a> {
                 self.gen_stmt(body);
                 emit!(self, "{}:", cont);
                 if let Some(i) = inc {
-                    self.gen_expr(i);
+                    self.gen_void(i);
                 }
                 emit!(self, "  jmp .L.begin.{}\n{}:", id, brk);
             }
@@ -881,7 +990,7 @@ impl<'a> Gen<'a> {
                     self.gen_stmt(s);
                 }
             }
-            NK::ExprStmt(e) => self.gen_expr(e),
+            NK::ExprStmt(e) => self.gen_void(e),
             _ => error_at(n.loc.0, n.loc.1, "invalid statement"),
         }
     }

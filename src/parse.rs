@@ -22,6 +22,7 @@ pub enum NK {
     Nop,
     Num(i64),
     FNum(f64),
+    LNum(u64, u16), // long double constant: mantissa, sign and exponent
     LVar(usize),
     GVar(String),
     Bin(Op, Box<Node>, Box<Node>),
@@ -188,7 +189,7 @@ pub fn new_cast(e: Node, ty: Ty) -> Node {
     }
     let same = match (&*e.ty, &*ty) {
         (Type::Int { size: a, unsigned: b }, Type::Int { size: c, unsigned: d }) => a == c && b == d,
-        (Type::Bool, Type::Bool) | (Type::Float, Type::Float) | (Type::Double, Type::Double) => true,
+        (Type::Bool, Type::Bool) | (Type::Float, Type::Float) | (Type::Double, Type::Double) | (Type::LDouble, Type::LDouble) => true,
         _ => false,
     };
     if same {
@@ -240,7 +241,7 @@ fn scale(idx: Node, base: &Ty, loc: Loc) -> Node {
 /// True for integer constant expressions (address constants excluded).
 fn is_const(n: &Node) -> bool {
     match &n.kind {
-        NK::Num(_) | NK::FNum(_) => true,
+        NK::Num(_) | NK::FNum(_) | NK::LNum(..) => true,
         NK::Bin(_, l, r) | NK::LogAnd(l, r) | NK::LogOr(l, r) => is_const(l) && is_const(r),
         NK::Neg(l) | NK::Not(l) | NK::BitNot(l) | NK::Cast(l) => is_const(l),
         NK::Cond(c, t, e) => is_const(c) && is_const(t) && is_const(e),
@@ -458,6 +459,7 @@ fn eval_double(n: &Node) -> f64 {
         NK::Comma(_, r) => eval_double(r),
         NK::Cast(l) => eval_double(l),
         NK::FNum(v) => *v,
+        NK::LNum(m, se) => f80_to_f64(*m, *se),
         _ => err(n.loc, "not a compile-time constant"),
     };
     if let Type::Float = &*n.ty { v as f32 as f64 } else { v }
@@ -827,8 +829,10 @@ impl Parser {
                 ty_ints(8, u)
             } else if c == FLOAT {
                 ty_float()
-            } else if c == DOUBLE || c == LONG + DOUBLE {
+            } else if c == DOUBLE {
                 ty_double()
+            } else if c == LONG + DOUBLE {
+                ty_ldouble()
             } else {
                 self.err("invalid type")
             };
@@ -1605,6 +1609,16 @@ impl Parser {
                 match ty {
                     Type::Float => put(buf, off, (eval_double(e) as f32).to_bits() as i64, 4),
                     Type::Double => put(buf, off, eval_double(e).to_bits() as i64, 8),
+                    Type::LDouble => {
+                        // shortcut: only a plain constant keeps its 64-bit mantissa; other
+                        // constant expressions are folded in double precision.
+                        let (m, se) = match &e.kind {
+                            NK::LNum(m, se) => (*m, *se),
+                            _ => f64_to_f80(eval_double(e)),
+                        };
+                        put(buf, off, m as i64, 8);
+                        put(buf, off + 8, se as i64, 2);
+                    }
                     _ => {
                         let mut label = String::new();
                         let v = eval2(e, Some(&mut label));
@@ -2000,7 +2014,13 @@ impl Parser {
         } else {
             decay(&t.ty)
         };
-        let (t, e) = if ty.is_numeric() { (new_cast(t, ty.clone()), new_cast(e, ty.clone())) } else { (t, e) };
+        let (t, e) = if ty.is_numeric() {
+            (new_cast(t, ty.clone()), new_cast(e, ty.clone()))
+        } else if let Type::Void = &*ty {
+            (mk(NK::Cast(bx(t)), ty.clone(), loc), mk(NK::Cast(bx(e)), ty.clone(), loc))
+        } else {
+            (t, e)
+        };
         mk(NK::Cond(bx(c), bx(t), bx(e)), ty, loc)
     }
 
@@ -2079,6 +2099,9 @@ impl Parser {
             let ty = common_type(&ty_int(), &e.ty);
             if let NK::Num(v) = e.kind {
                 return mk(NK::Num(wrap(v.wrapping_neg(), &ty)), ty, loc);
+            }
+            if let NK::LNum(m, se) = e.kind {
+                return mk(NK::LNum(m, se ^ 0x8000), ty, loc);
             }
             return mk(NK::Neg(bx(new_cast(e, ty.clone()))), ty, loc);
         }
@@ -2256,16 +2279,23 @@ impl Parser {
 
         let size8 = align_to(ty.size().max(1), 8);
         // Memory class: taken from the overflow area.
-        let mem = new_comma(bump(self, 2, size8), new_sub(field(self, 2), num(size8, loc), loc), loc);
+        let mut mem = new_comma(bump(self, 2, size8), new_sub(field(self, 2), num(size8, loc), loc), loc);
+        if ty.align() >= 16 {
+            // Such arguments are 16-byte aligned on the stack.
+            let up = new_binary(Op::BitAnd, new_add(new_cast(field(self, 2), ty_ulong()), num(15, loc), loc), num(-16, loc), loc);
+            let fix = new_assign(field(self, 2), mk(NK::Cast(bx(up)), ptr_to(ty_char()), loc), loc);
+            mem = new_comma(fix, mem, loc);
+        }
+        let in_mem = ty.size() > 16 || has_ldouble(&ty);
         let from_reg = |p: &Parser, i: usize, step: i64| new_sub(new_add(field(p, 3), new_cast(field(p, i), ty_long()), loc), num(step, loc), loc);
         let fits = |p: &Parser, i: usize, n: i64| {
             let (step, limit) = if i == 0 { (8, 48) } else { (16, 176) };
             new_binary(Op::Le, field(p, i), num(limit - step * n, loc), loc)
         };
-        let addr = if let Type::Struct(_) = &*ty {
-            if ty.size() > 16 {
-                mem
-            } else {
+        let addr = if in_mem {
+            mem
+        } else if let Type::Struct(_) = &*ty {
+            {
                 // Small struct: each eightbyte comes from the GP or the SSE save
                 // area; assemble them in a temporary.
                 let classes: Vec<usize> = [0, 8].iter().filter(|lo| **lo < ty.size()).map(|lo| crate::codegen::has_flonum(&ty, *lo, lo + 8, 0) as usize).collect();
@@ -2345,6 +2375,7 @@ impl Parser {
                 match t.nty {
                     NumTy::Float => mk(NK::FNum(t.fval), ty_float(), loc),
                     NumTy::Double => mk(NK::FNum(t.fval), ty_double(), loc),
+                    NumTy::LDouble => mk(NK::LNum(t.ival as u64, t.lexp), ty_ldouble(), loc),
                     NumTy::Int => mk(NK::Num(t.ival), ty_int(), loc),
                     NumTy::UInt => mk(NK::Num(t.ival), ty_uint(), loc),
                     NumTy::Long => mk(NK::Num(t.ival), ty_long(), loc),
