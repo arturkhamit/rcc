@@ -471,6 +471,7 @@ pub struct Parser {
     vla_pending: Vec<Node>, // size computations of VLA types parsed so far
     vla_saves: Vec<usize>,
     in_params: usize,
+    dropped_dims: usize,
 }
 
 pub fn parse(toks: Vec<Token>) -> Vec<Obj> {
@@ -517,6 +518,7 @@ fn new_parser(toks: Vec<Token>) -> Parser {
         vla_pending: vec![],
         vla_saves: vec![],
         in_params: 0,
+        dropped_dims: 0,
     };
     p.scopes[0].vars.insert("__builtin_va_list".into(), VS::Typedef(array_of(va_elem, 1)));
     p
@@ -864,6 +866,7 @@ impl Parser {
                 while !self.is("]") {
                     self.pos += 1;
                 }
+                self.dropped_dims += 1;
             } else if !self.is("]") {
                 let e = self.assign();
                 if is_const(&e) {
@@ -921,8 +924,13 @@ impl Parser {
                     break;
                 }
                 let base = self.declspec(None);
+                self.dropped_dims = 0;
                 let (ty, name) = self.declarator(base);
                 self.skip_attrs();
+                let outermost = matches!(&*ty, Type::Array(b, -1) if !matches!(&**b, Type::Array(_, -1)));
+                if self.dropped_dims > 1 || (self.dropped_dims == 1 && !outermost) {
+                    self.err("this form of variable-length array parameter is not supported");
+                }
                 params.push(decay(&ty));
                 names.push(name.unwrap_or_default());
             }
@@ -983,6 +991,9 @@ impl Parser {
                 first = false;
                 let (mty, name) = if self.is(":") { (base.clone(), None) } else { self.declarator(base.clone()) };
                 let mut m = Member { name: name.unwrap_or_default(), ty: mty, offset: 0, bit_width: -1, bit_off: 0 };
+                if let Type::Vla(..) = &*m.ty {
+                    self.err("variable-length array in a struct is not supported");
+                }
                 if self.consume(":") {
                     m.bit_width = self.const_expr();
                 }
@@ -1945,6 +1956,9 @@ impl Parser {
             }
             if e.ty.is_struct() {
                 err(loc, "invalid cast");
+            }
+            if matches!(&e.kind, NK::Member(_, m) if m.bit_width >= 0) {
+                return mk(NK::Cast(bx(e)), ty, loc);
             }
             return self.with_vla_sizes(new_cast(e, ty));
         }

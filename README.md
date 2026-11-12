@@ -20,11 +20,18 @@ Options: `-o`, `-c`, `-S`, `-E`, `-I`, `-D`, `-U`, `-l`, `-L`; other flags
 
 | Test | Result |
 |------|--------|
-| [c-testsuite](https://github.com/c-testsuite/c-testsuite) single-exec | 216 / 220 |
-| Local differential tests vs gcc (`tests/local`) | all pass |
+| [c-testsuite](https://github.com/c-testsuite/c-testsuite) single-exec | 220 / 223 (incl. local tests) |
+| gcc.c-torture/execute (GCC's own torture tests) | 1443 / 1701 |
 | Lua 5.4.7 built with rcc, official test suite (`all.lua`) | passes |
+| SQLite 3.46 amalgamation built with rcc | same query output as a gcc build |
 
-Run the tests with `./fetch_tests.sh && ./run_tests.sh`.
+Of the torture tests that do not pass, 239 are rejected at compile time
+(GNU extensions: inline asm, nested functions, labels as values, vector and
+complex types) and 19 produce a wrong result, all on GNU-specific behaviour
+(`aligned` attribute, bitfields wider than 32 bits, `__builtin_*` semantics).
+
+Run the tests with `./fetch_tests.sh && ./run_tests.sh`; the torture tests
+with `tests/torture.sh <path to gcc.c-torture/execute>`.
 
 ## Design
 
@@ -43,9 +50,12 @@ The generated code is unoptimized: every expression is evaluated into `%rax` /
 ## Not supported (yet)
 
 - `long double` is treated as `double` (so `printf("%Lf")` and `strtold` do not work)
-- variable-length arrays, `alloca`
 - `_Generic`, `_Complex`, `_Atomic`, thread-local storage
-- K&R-style function definitions, inline assembly, most GNU extensions
-  (statement expressions, `typeof` and `__attribute__` parsing are supported)
+- `__attribute__((aligned))`, `packed` and `_Alignas` are parsed and ignored
+- variable-length arrays work as local variables; VLAs inside structs and
+  multi-dimensional VLA parameters are rejected
+- K&R-style definitions are accepted but treated like prototypes
+- inline assembly and most GNU extensions (statement expressions, `typeof`,
+  `alloca`, `__builtin_va_*`, `__builtin_offsetof` are supported)
 - `const`/`volatile` are parsed and ignored; few diagnostics for invalid programs
 - no optimization, no debug info
