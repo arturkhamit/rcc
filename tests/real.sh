@@ -42,4 +42,29 @@ SQL
   $S/sqlite_gcc :memory: < $tmp/t.sql > $tmp/gcc.out 2>&1
   if cmp -s $tmp/rcc.out $tmp/gcc.out && grep -q '^ok$' $tmp/rcc.out; then echo "sqlite: OK ($(wc -l < $tmp/rcc.out) lines match gcc)"; else echo "sqlite: FAIL"; diff $tmp/rcc.out $tmp/gcc.out | head -10; fail=1; fi
 fi
+
+# Projects built with their own build systems (out of tree copies are not made:
+# each is cleaned first). A project passes if its own test suite does.
+check() { if [ $2 -eq 0 ]; then echo "$1: OK"; else echo "$1: FAIL"; fail=1; fi; }
+if [ -d $EXT/bzip2/bzip2-1.0.8 ]; then
+  (cd $EXT/bzip2/bzip2-1.0.8 && make clean && make CC=$RCC) > $tmp/bzip2.log 2>&1; check bzip2 $?
+fi
+if [ -d $EXT/zlib/zlib-1.3.1 ]; then
+  (cd $EXT/zlib/zlib-1.3.1 && { make distclean; CC=$RCC CFLAGS="-O -fPIC" ./configure && make && make test; }) > $tmp/zlib.log 2>&1; check zlib $?
+fi
+if [ -d $EXT/chibicc ]; then
+  (cd $EXT/chibicc && make clean && make CC=$RCC && make test CC=$RCC) > $tmp/chibicc.log 2>&1; check chibicc $?
+fi
+if [ -d $EXT/tinycc ]; then
+  # tcc built by rcc must compile and run its example programs and itself.
+  (cd $EXT/tinycc && { make distclean; ./configure --cc=$RCC && make && make -C tests hello-exe hello-run libtest libtest_mt; }) > $tmp/tcc.log 2>&1; check tinycc $?
+  # tcc's own feature test (without its inline assembly part), compiled by rcc and by gcc.
+  sed 's/^#if (defined(__i386__) || defined(__x86_64__)) && !(defined _WIN32 && CC_NAME == CC_clang)$/#if 0/' $EXT/tinycc/tests/tcctest.c > $tmp/tcctest.c
+  flags="-DCC_unknown=0 -I$EXT/tinycc -I$EXT/tinycc/tests -w"
+  $RCC $tmp/tcctest.c -o $tmp/tcctest.rcc $flags 2>/dev/null && gcc $tmp/tcctest.c -o $tmp/tcctest.gcc $flags -O0 -std=gnu99 2>/dev/null \
+    && (cd $EXT/tinycc/tests && $tmp/tcctest.rcc > $tmp/tt.rcc 2>&1; $tmp/tcctest.gcc > $tmp/tt.gcc 2>&1)
+  # __builtin_constant_p of expressions only an optimizer folds is the one accepted difference.
+  n=$(diff $tmp/tt.rcc $tmp/tt.gcc | grep -c '^[<>]' ); bad=$(diff $tmp/tt.rcc $tmp/tt.gcc | grep '^[<>]' | grep -vc 'res1[012] = ')
+  [ -s $tmp/tt.rcc ] && [ "$bad" = 0 ]; check "tcctest ($(wc -l < $tmp/tt.rcc) lines, $n differ from gcc)" $?
+fi
 exit $fail
