@@ -1,0 +1,6 @@
+target/
+tests/c-testsuite/
+*.o
+*.s
+a.out
+/tmp/
