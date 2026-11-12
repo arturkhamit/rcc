@@ -19,14 +19,17 @@ fn run(cmd: &mut Command) {
     }
 }
 
+#[derive(Default)]
 struct Opts {
     include_paths: Vec<String>,
+    after_paths: Vec<String>,     // -idirafter
     defines: Vec<(bool, String)>, // (is -D, argument)
+    includes: Vec<String>,        // -include
 }
 
 /// Returns the tokens of the builtin prelude and of the translation unit.
 fn preprocess(path: &str, opts: &Opts) -> (Vec<lex::Token>, Vec<lex::Token>) {
-    let mut pp = preprocess::Preprocessor::new(opts.include_paths.clone());
+    let mut pp = preprocess::Preprocessor::new(opts.include_paths.clone(), opts.after_paths.clone());
     for (def, arg) in &opts.defines {
         match (def, arg.split_once('=')) {
             (false, _) => pp.undef(arg),
@@ -34,7 +37,11 @@ fn preprocess(path: &str, opts: &Opts) -> (Vec<lex::Token>, Vec<lex::Token>) {
             (true, None) => pp.define(arg, "1"),
         }
     }
-    let toks = pp.run(path);
+    let mut toks = vec![];
+    for f in opts.includes.iter().map(|s| s.as_str()).chain([path]) {
+        toks.pop(); // the end-of-file token of the previous file
+        toks.extend(pp.run(f));
+    }
     (pp.prelude, toks)
 }
 
@@ -46,60 +53,137 @@ fn compile(path: &str, opts: &Opts) -> String {
     codegen::codegen(&globals)
 }
 
+fn with_ext(path: &str, ext: &str) -> String {
+    let name = std::path::Path::new(path).file_stem().unwrap().to_string_lossy().into_owned();
+    format!("{}.{}", name, ext)
+}
+
+/// Writes a Makefile dependency rule for the files read since `first_file`.
+fn write_deps(out: &str, target: &str, first_file: u32, system: bool, phony: bool) {
+    let mut deps: Vec<String> = vec![];
+    for name in (first_file..lex::file_count()).map(lex::file_name) {
+        if !name.starts_with('<') && (system || !name.starts_with("/usr/")) && !deps.contains(&name) {
+            deps.push(name);
+        }
+    }
+    let mut text = format!("{}: {}\n", target, deps.join(" \\\n  "));
+    if phony {
+        for d in deps.iter().skip(1) {
+            text += &format!("{}:\n", d);
+        }
+    }
+    if out == "-" {
+        print!("{}", text);
+    } else {
+        std::fs::write(out, text).unwrap_or_else(|e| die(&format!("{}: {}", out, e)));
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let (mut out, mut opt_c, mut opt_s, mut opt_e) = (None::<String>, false, false, false);
-    let (mut link_args, mut inputs) = (vec![], vec![]);
-    let mut opts = Opts { include_paths: vec![], defines: vec![] };
+    // Dependency output: -MD/-MMD (alongside compilation) or -M/-MM (instead of it).
+    let (mut dep_on, mut dep_only, mut dep_system, mut dep_phony) = (false, false, true, false);
+    let (mut dep_file, mut dep_target) = (None::<String>, None::<String>);
+    let mut link: Vec<String> = vec![]; // objects, libraries and linker options, in order
+    let mut inputs: Vec<(usize, String)> = vec![]; // (position in `link`, source file)
+    let mut opts = Opts::default();
+    let mut temps: Vec<String> = vec![];
     let mut i = 0;
     while i < args.len() {
-        let a = &args[i];
-        match a.as_str() {
-            "-o" | "-I" | "-D" | "-U" | "-include" => {
+        let a = args[i].as_str();
+        // Options taking a value, either joined (-Idir) or as the next argument (-I dir).
+        const VALUED: [&str; 16] = ["-o", "-I", "-D", "-U", "-include", "-isystem", "-iquote", "-idirafter", "-MF", "-MT", "-MQ", "-x", "-L", "-l", "-Xlinker", "-z"];
+        if let Some(opt) = VALUED.iter().find(|o| a.starts_with(**o) && (a.len() == o.len() || o.len() == 2)) {
+            let v = if a.len() > opt.len() {
+                a[opt.len()..].to_string()
+            } else {
                 i += 1;
-                let Some(v) = args.get(i) else { die(&format!("missing argument to {}", a)) };
-                match a.as_str() {
-                    "-o" => out = Some(v.clone()),
-                    "-I" => opts.include_paths.push(v.clone()),
-                    "-D" => opts.defines.push((true, v.clone())),
-                    "-U" => opts.defines.push((false, v.clone())),
-                    _ => die("-include is not supported"),
-                }
+                args.get(i).cloned().unwrap_or_else(|| die(&format!("missing argument to {}", a)))
+            };
+            match *opt {
+                "-o" => out = Some(v),
+                "-I" | "-isystem" | "-iquote" => opts.include_paths.push(v),
+                "-idirafter" => opts.after_paths.push(v),
+                "-D" => opts.defines.push((true, v)),
+                "-U" => opts.defines.push((false, v)),
+                "-include" => opts.includes.push(v),
+                "-MF" => dep_file = Some(v),
+                "-MT" | "-MQ" => dep_target = Some(v),
+                "-x" => {} // shortcut: every source is treated as C
+                "-L" | "-l" => link.push(format!("{}{}", opt, v)),
+                _ => link.extend([opt.to_string(), v]),
             }
+            i += 1;
+            continue;
+        }
+        match a {
             "-c" => opt_c = true,
             "-S" => opt_s = true,
             "-E" => opt_e = true,
-            _ if a.starts_with("-o") => out = Some(a[2..].to_string()),
-            _ if a.starts_with("-I") => opts.include_paths.push(a[2..].to_string()),
-            _ if a.starts_with("-D") => opts.defines.push((true, a[2..].to_string())),
-            _ if a.starts_with("-U") => opts.defines.push((false, a[2..].to_string())),
-            _ if a.starts_with("-l") || a.starts_with("-L") || a.starts_with("-Wl,") => link_args.push(a.clone()),
-            "-static" | "-shared" | "-pthread" | "-rdynamic" => link_args.push(a.clone()),
-            _ if a.starts_with('-') && a.len() > 1 => {} // -O2, -g, -W..., -std=..., -f...: ignored
-            _ => inputs.push(a.clone()),
+            "-MD" => dep_on = true,
+            "-MMD" => (dep_on, dep_system) = (true, false),
+            "-M" => (dep_on, dep_only) = (true, true),
+            "-MM" => (dep_on, dep_only, dep_system) = (true, true, false),
+            "-MP" => dep_phony = true,
+            "--version" | "-v" | "-V" => {
+                println!("rcc {} (C11 compiler for x86-64 Linux)", env!("CARGO_PKG_VERSION"));
+                if args.len() == 1 {
+                    return;
+                }
+            }
+            "-dumpversion" => return println!("{}", env!("CARGO_PKG_VERSION")),
+            "-dumpmachine" => return println!("x86_64-linux-gnu"),
+            "-" => {
+                // Source on standard input.
+                let path = format!("{}/rcc-{}-stdin.c", std::env::temp_dir().display(), std::process::id());
+                let mut src = vec![];
+                std::io::Read::read_to_end(&mut std::io::stdin(), &mut src).unwrap_or_else(|e| die(&format!("stdin: {}", e)));
+                std::fs::write(&path, src).unwrap_or_else(|e| die(&format!("{}: {}", path, e)));
+                temps.push(path.clone());
+                inputs.push((link.len(), path.clone()));
+                link.push(path);
+            }
+            "-s" | "-static" | "-shared" | "-pthread" | "-rdynamic" | "-pie" | "-no-pie" | "-nostdlib" | "-nostartfiles" | "-nodefaultlibs"
+            | "-static-libgcc" | "-static-pie" => link.push(a.to_string()),
+            _ if a.starts_with("-Wl,") => link.push(a.to_string()),
+            _ if a.starts_with('-') => {} // -O2, -g, -W..., -std=..., -f..., -m...: ignored
+            _ => {
+                if a.ends_with(".c") || a.ends_with(".s") || a.ends_with(".S") {
+                    inputs.push((link.len(), a.to_string()));
+                }
+                link.push(a.to_string());
+            }
         }
         i += 1;
     }
-    if inputs.is_empty() {
+    let no_link = opt_c || opt_s || opt_e || dep_only;
+    if inputs.is_empty() && (no_link || link.iter().all(|l| l.starts_with('-'))) {
         die("no input files");
     }
-    if out.is_some() && (opt_c || opt_s || opt_e) && inputs.len() > 1 {
+    if out.is_some() && no_link && inputs.len() > 1 {
         die("cannot specify -o with -c, -S or -E with multiple files");
     }
 
-    let stem = |p: &str, ext: &str| {
-        let name = std::path::Path::new(p).file_stem().unwrap().to_string_lossy().into_owned();
-        format!("{}.{}", name, ext)
-    };
-    let mut objs: Vec<String> = vec![];
-    let mut temps: Vec<String> = vec![];
-    for (n, input) in inputs.iter().enumerate() {
+    for (n, (slot, input)) in inputs.iter().enumerate() {
+        let tmp = |ext: &str| format!("{}/rcc-{}-{}.{}", std::env::temp_dir().display(), std::process::id(), n, ext);
+        let obj = if opt_c { out.clone().unwrap_or_else(|| with_ext(input, "o")) } else { tmp("o") };
         if !input.ends_with(".c") {
-            objs.push(input.clone());
+            // Assembly sources go to the system assembler (through cc, for .S).
+            if opt_c {
+                run(Command::new("cc").args(["-c", "-o", &obj, input]));
+            }
             continue;
         }
-        if opt_e {
-            let text = preprocess::to_text(&preprocess(input, &opts).1);
+        let first_file = lex::file_count();
+        if opt_e || dep_only {
+            let toks = preprocess(input, &opts).1;
+            if dep_only {
+                let target = dep_target.clone().unwrap_or_else(|| with_ext(input, "o"));
+                write_deps(dep_file.as_deref().or(out.as_deref()).unwrap_or("-"), &target, first_file, dep_system, dep_phony);
+                continue;
+            }
+            let text = preprocess::to_text(&toks);
             match &out {
                 Some(o) => std::fs::write(o, text + "\n").unwrap_or_else(|e| die(&format!("{}: {}", o, e))),
                 None => println!("{}", text),
@@ -107,24 +191,27 @@ fn main() {
             continue;
         }
         let asm = compile(input, &opts);
-        let tmp = |ext: &str| format!("{}/rcc-{}-{}.{}", std::env::temp_dir().display(), std::process::id(), n, ext);
-        let asm_path = if opt_s { out.clone().unwrap_or_else(|| stem(input, "s")) } else { tmp("s") };
+        let asm_path = if opt_s { out.clone().unwrap_or_else(|| with_ext(input, "s")) } else { tmp("s") };
         std::fs::write(&asm_path, asm).unwrap_or_else(|e| die(&format!("{}: {}", asm_path, e)));
+        if dep_on {
+            let main_out = if opt_s { &asm_path } else { &obj };
+            let file = dep_file.clone().unwrap_or_else(|| std::path::Path::new(main_out).with_extension("d").to_string_lossy().into_owned());
+            write_deps(&file, dep_target.as_deref().unwrap_or(main_out), first_file, dep_system, dep_phony);
+        }
         if opt_s {
             continue;
         }
         temps.push(asm_path.clone());
-        let obj = if opt_c { out.clone().unwrap_or_else(|| stem(input, "o")) } else { tmp("o") };
         run(Command::new("as").args(["-o", &obj, &asm_path]));
         if !opt_c {
             temps.push(obj.clone());
+            link[*slot] = obj;
         }
-        objs.push(obj);
     }
-    if !(opt_c || opt_s || opt_e) {
+    if !no_link {
         let exe = out.unwrap_or_else(|| "a.out".to_string());
         // The system C compiler is used only as the linker driver (crt files, libc).
-        run(Command::new("cc").args(["-o", &exe]).args(&objs).args(&link_args).arg("-lm"));
+        run(Command::new("cc").args(["-o", &exe]).args(&link).arg("-lm"));
     }
     for t in temps {
         let _ = std::fs::remove_file(t);

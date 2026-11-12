@@ -143,12 +143,13 @@ fn read_line(inp: &mut Vec<Token>) -> Vec<Token> {
 }
 
 impl Preprocessor {
-    pub fn new(user_paths: Vec<String>) -> Preprocessor {
+    pub fn new(user_paths: Vec<String>, after_paths: Vec<String>) -> Preprocessor {
         let mut include_paths = user_paths;
         include_paths.push(BUILTIN_DIR.to_string());
         for d in ["/usr/local/include", "/usr/include/x86_64-linux-gnu", "/usr/include"] {
             include_paths.push(d.to_string());
         }
+        include_paths.extend(after_paths);
         let mut pp = Preprocessor { macros: HashMap::new(), conds: vec![], include_paths, once: HashSet::new(), pushed: HashMap::new(), counter: 0, depth: 0, prelude: vec![] };
         let mut inp = tokenize(PREDEFINED.as_bytes(), add_file("<built-in>"));
         inp.reverse();

@@ -498,6 +498,7 @@ pub struct Parser {
     // Collected by skip_attrs / _Alignas since they were last reset.
     attr_packed: bool,
     attr_align: i64,
+    attr_mode: u8, // __attribute__((mode(..))): integer size, 0 if absent
     pack_points: Vec<(usize, i64)>, // #pragma pack: (token position, value from there on)
 }
 
@@ -575,6 +576,7 @@ fn new_parser(mut toks: Vec<Token>) -> Parser {
         dropped_dims: 0,
         attr_packed: false,
         attr_align: 0,
+        attr_mode: 0,
         pack_points,
     };
     p.scopes[0].vars.insert("__builtin_va_list".into(), VS::Typedef(array_of(va_elem, 1)));
@@ -650,6 +652,18 @@ impl Parser {
                         self.expect(")");
                     }
                     "aligned" => self.attr_align = self.attr_align.max(16),
+                    "mode" => {
+                        self.expect("(");
+                        self.attr_mode = match self.tok().s.trim_matches('_') {
+                            "QI" | "byte" => 1,
+                            "HI" => 2,
+                            "SI" => 4,
+                            "DI" | "word" | "pointer" => 8,
+                            _ => self.err("unsupported mode attribute"),
+                        };
+                        self.pos += 1;
+                        self.expect(")");
+                    }
                     _ if self.is("(") => self.skip_parens(),
                     _ if self.tok().kind == TK::Eof => self.err("unterminated attribute"),
                     _ => {}
@@ -812,7 +826,7 @@ impl Parser {
 
         let mut ty = ty_int();
         let mut counter = 0u32;
-        (self.attr_packed, self.attr_align) = (false, 0);
+        (self.attr_packed, self.attr_align, self.attr_mode) = (false, 0, 0);
         while self.is_typename() {
             let s = self.tok().s.clone();
             match s.as_str() {
@@ -913,6 +927,10 @@ impl Parser {
         }
         if let Some(a) = attr {
             a.align = self.attr_align;
+        }
+        if self.attr_mode != 0 && ty.is_integer() {
+            ty = ty_ints(self.attr_mode, ty.is_unsigned());
+            self.attr_mode = 0;
         }
         ty
     }
@@ -1243,9 +1261,12 @@ impl Parser {
                 self.expect(",");
             }
             first = false;
-            self.attr_align = 0;
-            let (ty, name) = self.declarator(base.clone());
+            (self.attr_align, self.attr_mode) = (0, 0);
+            let (mut ty, name) = self.declarator(base.clone());
             self.skip_attrs();
+            if self.attr_mode != 0 && ty.is_integer() {
+                ty = ty_ints(self.attr_mode, ty.is_unsigned()); // typedef int T __attribute__((mode(DI)))
+            }
             if let (true, Type::Struct(sd)) = (self.attr_align > 0, &*ty) {
                 // `typedef struct {..} T __attribute__((aligned(n)))`
                 // shortcut: this raises the alignment of the struct type itself.
@@ -2554,7 +2575,8 @@ impl Parser {
                         self.expect("(");
                         let e = self.expr();
                         self.expect(")");
-                        return num(is_const(&e) as i64, loc);
+                        let literal = matches!(&e.kind, NK::GVar(name) if name.starts_with(".L.str"));
+                        return num((is_const(&e) || literal) as i64, loc);
                     }
                     "__builtin_choose_expr" => {
                         self.expect("(");

@@ -12,6 +12,10 @@ pub fn add_file(name: &str) -> u32 {
     })
 }
 
+pub fn file_count() -> u32 {
+    FILES.with(|f| f.borrow().len() as u32)
+}
+
 pub fn file_name(i: u32) -> String {
     FILES.with(|f| f.borrow().get(i as usize).cloned().unwrap_or_default())
 }
