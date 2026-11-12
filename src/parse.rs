@@ -428,6 +428,22 @@ pub struct Parser {
 }
 
 pub fn parse(toks: Vec<Token>) -> Vec<Obj> {
+    let mut p = new_parser(toks);
+    p.program();
+    p.globals
+}
+
+/// Evaluates an integer constant expression (for #if).
+pub fn const_expr_tokens(toks: Vec<Token>) -> i64 {
+    let mut p = new_parser(toks);
+    let v = p.const_expr();
+    if p.tok().kind != TK::Eof {
+        p.err("extra tokens in constant expression");
+    }
+    v
+}
+
+fn new_parser(toks: Vec<Token>) -> Parser {
     // struct __va_elem as defined by the System V x86-64 ABI
     let mem = |name: &str, ty: Ty, offset: i64| Member { name: name.into(), ty, offset, bit_width: -1, bit_off: 0 };
     let members = vec![
@@ -454,8 +470,7 @@ pub fn parse(toks: Vec<Token>) -> Vec<Obj> {
         va_elem: va_elem.clone(),
     };
     p.scopes[0].vars.insert("__builtin_va_list".into(), VS::Typedef(array_of(va_elem, 1)));
-    p.program();
-    p.globals
+    p
 }
 
 impl Parser {
@@ -749,7 +764,15 @@ impl Parser {
     /// Parses a (possibly abstract) declarator. Returns the type and the name.
     fn declarator(&mut self, ty: Ty) -> (Ty, Option<String>) {
         let ty = self.pointers(ty);
-        if self.is("(") && !self.is_typename_at(self.pos + 1) && !self.is_at(1, ")") {
+        let nested = self.is("(") && {
+            let save = self.pos;
+            self.pos += 1;
+            self.skip_attrs();
+            let r = !self.is_typename() && !self.is(")");
+            self.pos = save;
+            r
+        };
+        if nested {
             // Nested declarator: parse the suffix first, then the inner part.
             let start = self.pos + 1;
             self.pos = start;
@@ -777,6 +800,9 @@ impl Parser {
         if self.consume("[") {
             while self.is("static") || self.is("restrict") || self.is("const") || self.is("volatile") {
                 self.pos += 1;
+            }
+            if self.is("*") && self.is_at(1, "]") {
+                self.pos += 1; // `[*]`: array of unspecified size in a prototype
             }
             let len = if self.is("]") { -1 } else { self.const_expr() };
             self.expect("]");
@@ -918,19 +944,18 @@ impl Parser {
 
     fn enum_spec(&mut self) -> Ty {
         self.skip_attrs();
-        if self.tok().kind == TK::Ident {
-            self.pos += 1;
-        }
+        let tag = if self.tok().kind == TK::Ident { Some(self.ident()) } else { None };
         if !self.consume("{") {
-            return ty_int();
+            return tag.and_then(|t| self.find_tag(&t)).filter(|t| !t.is_struct()).unwrap_or_else(ty_int);
         }
-        let mut val = 0i64;
+        let (mut val, mut negative) = (0i64, false);
         while !self.consume("}") {
             let name = self.ident();
             self.skip_attrs();
             if self.consume("=") {
                 val = self.const_expr();
             }
+            negative |= val < 0;
             self.scope().vars.insert(name, VS::Enum(val));
             val += 1;
             if !self.consume(",") {
@@ -938,7 +963,12 @@ impl Parser {
                 break;
             }
         }
-        ty_int()
+        // Like GCC, an enum without negative enumerators is unsigned.
+        let ty = if negative { ty_int() } else { ty_uint() };
+        if let Some(tag) = tag {
+            self.scope().tags.insert(tag, ty.clone());
+        }
+        ty
     }
 
     fn parse_typedef(&mut self, base: Ty) {
