@@ -166,6 +166,13 @@ impl<'a> Gen<'a> {
     /// Evaluates an expression whose value is not used. A long double must be
     /// popped: the x87 register stack holds only eight values.
     fn gen_void(&mut self, n: &Node) {
+        // `i++` is `(i += 1) - 1`: as a statement only the assignment matters.
+        let int_like = |t: &Type| t.is_integer() || matches!(t, Type::Ptr(_));
+        match &n.kind {
+            NK::Cast(l) if int_like(&n.ty) && int_like(&l.ty) => return self.gen_void(l),
+            NK::Bin(Op::Add | Op::Sub, l, r) if int_like(&n.ty) && matches!(r.kind, NK::Num(_)) => return self.gen_void(l),
+            _ => {}
+        }
         self.gen_expr(n);
         if let Type::LDouble = *n.ty {
             emit!(self, "  fstp %st(0)");
@@ -390,7 +397,9 @@ impl<'a> Gen<'a> {
             }
             NK::Member(l, m) => {
                 self.gen_addr(l);
-                emit!(self, "  add ${}, %rax", m.offset);
+                if m.offset != 0 {
+                    emit!(self, "  add ${}, %rax", m.offset);
+                }
             }
             // Struct-valued expressions evaluate to the address of the struct.
             NK::Call { .. } | NK::Assign(..) | NK::Cond(..) | NK::StmtExpr(_) | NK::Cast(_) if n.ty.is_struct() => self.gen_expr(n),
@@ -434,7 +443,19 @@ impl<'a> Gen<'a> {
                 if dst != "(%rdi)" {
                     emit!(self, "  lea {}, %rdi", dst);
                 }
-                emit!(self, "  mov %rax, %rsi\n  mov ${}, %ecx\n  rep movsb", ty.size());
+                let size = ty.size();
+                if size <= 64 {
+                    // Small structs are copied through %rcx.
+                    let mut k = 0;
+                    for (step, reg) in [(8, "%rcx"), (4, "%ecx"), (2, "%cx"), (1, "%cl")] {
+                        while size - k >= step {
+                            emit!(self, "  mov {}(%rax), {}\n  mov {}, {}(%rdi)", k, reg, reg, k);
+                            k += step;
+                        }
+                    }
+                } else {
+                    emit!(self, "  mov %rax, %rsi\n  mov ${}, %ecx\n  rep movsb", size);
+                }
             }
             Type::Float => emit!(self, "  movss %xmm0, {}", dst),
             Type::Double => emit!(self, "  movsd %xmm0, {}", dst),
@@ -454,8 +475,88 @@ impl<'a> Gen<'a> {
             NK::LVar(_) if matches!(*n.ty, Type::Vla(..)) => None,
             NK::LVar(i) => Some(format!("{}(%rbp)", self.offs[*i])),
             NK::GVar(name) if self.defined.contains(name.as_str()) && !self.tls.contains(name.as_str()) => Some(format!("{}(%rip)", name)),
+            NK::Member(l, m) if m.bit_width < 0 => {
+                let base = self.direct(l)?;
+                let (disp, reg) = base.split_once('(')?;
+                Some(match reg {
+                    "%rbp)" => format!("{}(%rbp)", disp.parse::<i64>().ok()? + m.offset),
+                    _ => format!("{}+{}({}", disp, m.offset, reg),
+                })
+            }
             _ => None,
         }
+    }
+
+    /// An instruction that loads an integer operand without side effects into a
+    /// register, touching no other register. None if `n` is not that simple.
+    fn simple_load(&self, n: &Node, r64: &str, r32: &str) -> Option<String> {
+        let int_like = |t: &Type| t.is_integer() || matches!(t, Type::Ptr(_));
+        // Loads the variable at `m` extended to 64 bits (or to 32, which is enough for `want`).
+        let load = |ty: &Type, m: &str, want: i64| -> Option<String> {
+            Some(match ty {
+                Type::Bool | Type::Int { size: 1, unsigned: true } => format!("  movzbl {}, {}", m, r32),
+                Type::Int { size: 1, .. } => format!("  movsbq {}, {}", m, r64),
+                Type::Int { size: 2, unsigned: true } => format!("  movzwl {}, {}", m, r32),
+                Type::Int { size: 2, .. } => format!("  movswq {}, {}", m, r64),
+                Type::Int { size: 4, unsigned: false } if want == 8 => format!("  movslq {}, {}", m, r64),
+                Type::Int { size: 4, .. } => format!("  mov {}, {}", m, r32),
+                Type::Int { .. } | Type::Ptr(_) => format!("  mov {}, {}", m, r64),
+                Type::Array(..) | Type::Func(_) => format!("  lea {}, {}", m, r64),
+                _ => return None,
+            })
+        };
+        match &n.kind {
+            NK::Num(v) if int_like(&n.ty) => Some(if *v >= 0 && *v == *v as i32 as i64 { format!("  mov ${}, {}", v, r32) } else { format!("  mov ${}, {}", v, r64) }),
+            NK::LVar(_) | NK::GVar(_) | NK::Member(..) => load(&n.ty, &self.direct(n)?, n.ty.size()),
+            NK::Addr(l) => Some(format!("  lea {}, {}", self.direct(l)?, r64)),
+            // A widening conversion of a variable.
+            NK::Cast(l) if int_like(&n.ty) && l.ty.is_integer() && !matches!(*n.ty, Type::Bool) && n.ty.size() >= l.ty.size() => match &l.kind {
+                NK::LVar(_) | NK::GVar(_) | NK::Member(..) => load(&l.ty, &self.direct(l)?, n.ty.size()),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// The same for a float or double operand and an SSE register (may use %rax).
+    fn simple_fload(&self, n: &Node, reg: usize) -> Option<String> {
+        match (&n.kind, &*n.ty) {
+            (NK::FNum(v), Type::Float) => Some(format!("  mov ${}, %eax\n  movd %eax, %xmm{}", (*v as f32).to_bits(), reg)),
+            (NK::FNum(v), Type::Double) => Some(format!("  mov ${}, %rax\n  movq %rax, %xmm{}", v.to_bits() as i64, reg)),
+            (NK::LVar(_) | NK::GVar(_) | NK::Member(..), Type::Float) => Some(format!("  movss {}, %xmm{}", self.direct(n)?, reg)),
+            (NK::LVar(_) | NK::GVar(_) | NK::Member(..), Type::Double) => Some(format!("  movsd {}, %xmm{}", self.direct(n)?, reg)),
+            _ => None,
+        }
+    }
+
+    /// Evaluates the operands of an integer operation: the left one into %rax, the
+    /// right one into %rdi, or returned as an immediate. The stack is used only
+    /// when neither operand is simple.
+    fn gen_operands(&mut self, op: Op, l: &Node, r: &Node) -> Option<i64> {
+        if let NK::Num(v) = r.kind {
+            if !matches!(op, Op::Div | Op::Mod) && v == v as i32 as i64 && !r.ty.is_flonum() {
+                self.gen_expr(l);
+                return Some(v);
+            }
+        }
+        let commutative = matches!(op, Op::Add | Op::Mul | Op::BitAnd | Op::BitOr | Op::BitXor | Op::Eq | Op::Ne);
+        if let Some(ins) = self.simple_load(r, "%rdi", "%edi") {
+            self.gen_expr(l);
+            emit!(self, "{}", ins);
+        } else if let (true, Some(ins)) = (commutative, self.simple_load(l, "%rdi", "%edi")) {
+            self.gen_expr(r); // operands swapped
+            emit!(self, "{}", ins);
+        } else if self.simple_load(l, "%rdi", "%edi").is_some() {
+            self.gen_expr(r);
+            emit!(self, "  mov %rax, %rdi");
+            self.gen_expr(l); // simple: leaves %rdi alone
+        } else {
+            self.gen_expr(r);
+            self.push();
+            self.gen_expr(l);
+            self.pop("%rdi");
+        }
+        None
     }
 
     fn cmp_zero(&mut self, ty: &Ty) {
@@ -598,6 +699,13 @@ impl<'a> Gen<'a> {
                     self.load(&n.ty);
                 }
             },
+            NK::Member(l, m) if m.bit_width < 0 => match self.direct(n) {
+                Some(mem) => self.load_from(&n.ty, &mem),
+                None => {
+                    self.gen_addr(l);
+                    self.load_from(&n.ty, &format!("{}(%rax)", m.offset));
+                }
+            },
             NK::Member(_, m) => {
                 self.gen_addr(n);
                 self.load(&n.ty);
@@ -619,6 +727,13 @@ impl<'a> Gen<'a> {
                     return;
                 }
                 self.gen_addr(l);
+                let bitfield = matches!(&l.kind, NK::Member(_, m) if m.bit_width >= 0);
+                if !bitfield && (self.simple_load(r, "%rdi", "%edi").is_some() || self.simple_fload(r, 0).is_some()) {
+                    emit!(self, "  mov %rax, %rdi");
+                    self.gen_expr(r); // simple: leaves %rdi alone
+                    self.store_to(&n.ty, "(%rdi)");
+                    return;
+                }
                 self.push();
                 self.gen_expr(r);
                 if let NK::Member(_, m) = &l.kind {
@@ -641,8 +756,18 @@ impl<'a> Gen<'a> {
                 self.store(&n.ty);
             }
             NK::MemZero(i) => {
-                let f = self.func.unwrap();
-                emit!(self, "  mov ${}, %ecx\n  lea {}(%rbp), %rdi\n  mov $0, %al\n  rep stosb", f.locals[*i].ty.size(), self.offs[*i]);
+                let (size, off) = (self.func.unwrap().locals[*i].ty.size(), self.offs[*i]);
+                if size <= 64 {
+                    let mut k = 0;
+                    for (step, ins) in [(8, "movq"), (4, "movl"), (2, "movw"), (1, "movb")] {
+                        while size - k >= step {
+                            emit!(self, "  {} $0, {}(%rbp)", ins, off + k);
+                            k += step;
+                        }
+                    }
+                } else {
+                    emit!(self, "  mov ${}, %ecx\n  lea {}(%rbp), %rdi\n  mov $0, %al\n  rep stosb", size, off);
+                }
             }
             NK::Alloca(size) => {
                 self.gen_expr(size);
@@ -740,12 +865,11 @@ impl<'a> Gen<'a> {
                 }
             }
             NK::Bin(op @ (Op::Eq | Op::Ne | Op::Lt | Op::Le), l, r) if !l.ty.is_flonum() => {
-                self.gen_expr(r);
-                self.push();
-                self.gen_expr(l);
-                self.pop("%rdi");
                 let wide = l.ty.size() == 8 || l.ty.base().is_some();
-                emit!(self, "  cmp {}", if wide { "%rdi, %rax" } else { "%edi, %eax" });
+                match self.gen_operands(*op, l, r) {
+                    Some(v) => emit!(self, "  cmp ${}, {}", v, if wide { "%rax" } else { "%eax" }),
+                    None => emit!(self, "  cmp {}", if wide { "%rdi, %rax" } else { "%edi, %eax" }),
+                }
                 let cc = match (op, l.ty.is_unsigned(), when) {
                     (Op::Eq, _, true) | (Op::Ne, _, false) => "e",
                     (Op::Eq, _, false) | (Op::Ne, _, true) => "ne",
@@ -779,10 +903,24 @@ impl<'a> Gen<'a> {
         if l.ty.is_flonum() {
             // Long double: %st(0) = right operand, %st(1) = left operand.
             let ld = matches!(*l.ty, Type::LDouble);
-            self.gen_expr(r);
-            if ld { self.pushld() } else { self.pushf() }
-            self.gen_expr(l);
-            if ld { self.popld() } else { self.popf(1) }
+            if ld {
+                self.gen_expr(r);
+                self.pushld();
+                self.gen_expr(l);
+                self.popld();
+            } else if let Some(ins) = self.simple_fload(r, 1) {
+                self.gen_expr(l);
+                emit!(self, "{}", ins);
+            } else if self.simple_fload(l, 0).is_some() {
+                self.gen_expr(r);
+                emit!(self, "  movaps %xmm0, %xmm1");
+                self.gen_expr(l); // simple: leaves %xmm1 alone
+            } else {
+                self.gen_expr(r);
+                self.pushf();
+                self.gen_expr(l);
+                self.popf(1);
+            }
             let s = if let Type::Float = *l.ty { "ss" } else { "sd" };
             match op {
                 Op::Add if ld => emit!(self, "  faddp"),
@@ -811,16 +949,20 @@ impl<'a> Gen<'a> {
             }
             return;
         }
-        self.gen_expr(r);
-        self.push();
-        self.gen_expr(l);
-        self.pop("%rdi");
+        let imm = self.gen_operands(op, l, r);
         let wide = l.ty.size() == 8 || l.ty.base().is_some();
         let (ax, di, dx) = if wide { ("%rax", "%rdi", "%rdx") } else { ("%eax", "%edi", "%edx") };
+        let imm_text = imm.map(|v| format!("${}", v));
+        let di = imm_text.as_deref().unwrap_or(di);
         let uns = l.ty.is_unsigned();
         match op {
             Op::Add => emit!(self, "  add {}, {}", di, ax),
             Op::Sub => emit!(self, "  sub {}, {}", di, ax),
+            Op::Mul if imm.is_some() => emit!(self, "  imul {}, {}, {}", di, ax, ax),
+            Op::Shl | Op::Shr if imm.is_some() => {
+                let ins = if op == Op::Shl { "shl" } else if uns { "shr" } else { "sar" };
+                emit!(self, "  {} ${}, {}", ins, imm.unwrap() & 63, ax);
+            }
             Op::Mul => emit!(self, "  imul {}, {}", di, ax),
             Op::Div | Op::Mod => {
                 if uns {
@@ -906,7 +1048,30 @@ impl<'a> Gen<'a> {
             self.push_arg(a);
             end = arg_offs[i];
         }
-        for (a, _) in args.iter().zip(&on_stack).rev().filter(|(_, s)| !**s) {
+        // Simple register arguments are not pushed: they are loaded straight into
+        // their registers once the others have been evaluated.
+        let mut late: Vec<Option<String>> = vec![None; args.len()];
+        let (mut ng, mut nf) = (ret_mem as usize, 0);
+        for (i, a) in args.iter().enumerate().filter(|(i, _)| !on_stack[*i]) {
+            match &*a.ty {
+                Type::Struct(_) => {
+                    for lo in [0, 8] {
+                        if lo < a.ty.size() {
+                            if has_flonum(&a.ty, lo, lo + 8, 0) { nf += 1 } else { ng += 1 }
+                        }
+                    }
+                }
+                Type::Float | Type::Double => {
+                    late[i] = self.simple_fload(a, nf);
+                    nf += 1;
+                }
+                _ => {
+                    late[i] = self.simple_load(a, ARG64[ng], ARG32[ng]);
+                    ng += 1;
+                }
+            }
+        }
+        for (_, a) in args.iter().enumerate().rev().filter(|(i, _)| !on_stack[*i] && late[*i].is_none()) {
             self.push_arg(a);
         }
         let direct = match &f.kind {
@@ -922,7 +1087,7 @@ impl<'a> Gen<'a> {
             emit!(self, "  lea {}(%rbp), %rdi", self.offs[ret_buf.unwrap()]);
             gp = 1;
         }
-        for (a, _) in args.iter().zip(&on_stack).filter(|(_, s)| !**s) {
+        for (i, a) in args.iter().enumerate().filter(|(i, _)| !on_stack[*i]) {
             match &*a.ty {
                 Type::Struct(_) => {
                     for lo in [0, 8] {
@@ -939,14 +1104,21 @@ impl<'a> Gen<'a> {
                     }
                 }
                 Type::Float | Type::Double => {
-                    self.popf(fp);
+                    if late[i].is_none() {
+                        self.popf(fp);
+                    }
                     fp += 1;
                 }
                 _ => {
-                    self.pop(ARG64[gp]);
+                    if late[i].is_none() {
+                        self.pop(ARG64[gp]);
+                    }
                     gp += 1;
                 }
             }
+        }
+        for ins in late.iter().flatten() {
+            emit!(self, "{}", ins);
         }
         emit!(self, "  mov ${}, %eax", fp);
         match direct {
