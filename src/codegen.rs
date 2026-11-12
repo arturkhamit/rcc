@@ -483,12 +483,16 @@ impl<'a> Gen<'a> {
                     if m.bit_width >= 0 {
                         // Merge the new value into the bitfield's storage unit.
                         let mask = (1u64 << m.bit_width) - 1;
-                        emit!(self, "  mov %rax, %r8\n  mov ${}, %r9\n  and %r9, %rax\n  mov %rax, %rdi\n  shl ${}, %rdi", mask as i64, m.bit_off);
+                        emit!(self, "  mov ${}, %r9\n  and %r9, %rax\n  mov %rax, %r8\n  mov %rax, %rdi\n  shl ${}, %rdi", mask as i64, m.bit_off);
                         emit!(self, "  mov (%rsp), %rax");
                         self.load(&m.ty);
                         emit!(self, "  mov ${}, %r9\n  and %r9, %rax\n  or %rdi, %rax", !(mask << m.bit_off) as i64);
                         self.store(&n.ty);
+                        // The value of the expression is the value stored in the bitfield.
                         emit!(self, "  mov %r8, %rax");
+                        if !m.ty.is_unsigned() {
+                            emit!(self, "  shl ${}, %rax\n  sar ${}, %rax", 64 - m.bit_width, 64 - m.bit_width);
+                        }
                         return;
                     }
                 }

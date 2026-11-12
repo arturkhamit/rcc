@@ -190,7 +190,19 @@ pub fn new_cast(e: Node, ty: Ty) -> Node {
     mk(NK::Cast(bx(e)), ty, loc)
 }
 
+/// Bitfields narrower than int promote to int, whatever their declared type.
+fn bf(n: Node) -> Node {
+    match &n.kind {
+        NK::Member(_, m) if (0..32).contains(&m.bit_width) && n.ty.is_integer() => {
+            let loc = n.loc;
+            mk(NK::Cast(bx(n)), ty_int(), loc)
+        }
+        _ => n,
+    }
+}
+
 fn arith(op: Op, l: Node, r: Node, loc: Loc) -> Node {
+    let (l, r) = (bf(l), bf(r));
     if !l.ty.is_numeric() && l.ty.base().is_none() && !matches!(*l.ty, Type::Func(_)) || r.ty.is_struct() {
         err(loc, "invalid operands");
     }
@@ -241,6 +253,7 @@ fn new_binary(op: Op, l: Node, r: Node, loc: Loc) -> Node {
         Op::Add => new_add(l, r, loc),
         Op::Sub => new_sub(l, r, loc),
         Op::Shl | Op::Shr => {
+            let l = bf(l);
             let ty = promote(&l.ty);
             mk(NK::Bin(op, bx(new_cast(l, ty.clone())), bx(r)), ty, loc)
         }
@@ -519,7 +532,7 @@ impl Parser {
     }
     /// Skips `__attribute__((...))` and `__asm__("...")`.
     fn skip_attrs(&mut self) {
-        while self.is("__attribute__") || self.is("__asm__") || self.is("__asm") {
+        while self.is("__attribute__") || self.is_asm() {
             self.pos += 1;
             self.expect("(");
             let mut depth = 1;
@@ -535,6 +548,9 @@ impl Parser {
                 self.pos += 1;
             }
         }
+    }
+    fn is_asm(&self) -> bool {
+        self.is("asm") || self.is("__asm__") || self.is("__asm")
     }
     fn skip_to_semi(&mut self) {
         while !self.consume(";") {
@@ -994,7 +1010,7 @@ impl Parser {
             if self.consume(";") {
                 continue;
             }
-            if self.is("_Static_assert") || self.is("__asm__") || self.is("__asm") {
+            if self.is("_Static_assert") || self.is_asm() {
                 self.skip_to_semi();
                 continue;
             }
@@ -1013,7 +1029,29 @@ impl Parser {
                 let (ty, name) = self.declarator(base.clone());
                 self.skip_attrs();
                 let Some(name) = name else { self.err("variable name omitted") };
-                if let Type::Func(_) = &*ty {
+                if let Type::Func(fty) = &*ty {
+                    let mut ty = ty.clone();
+                    if self.is_typename() {
+                        // K&R definition: parameter declarations follow the declarator.
+                        // shortcut: it then behaves like a prototype (no default promotions
+                        // on the callee side), fine as long as callers are compiled by rcc.
+                        let mut params = fty.params.clone();
+                        while !self.is("{") {
+                            let base = self.declspec(None);
+                            loop {
+                                let (pty, pname) = self.declarator(base.clone());
+                                match fty.names.iter().position(|n| Some(n) == pname.as_ref()) {
+                                    Some(i) => params[i] = decay(&pty),
+                                    None => self.err("declaration for a non-parameter"),
+                                }
+                                if !self.consume(",") {
+                                    break;
+                                }
+                            }
+                            self.expect(";");
+                        }
+                        ty = Rc::new(Type::Func(Rc::new(FuncTy { ret: fty.ret.clone(), params, names: fty.names.clone(), variadic: false, oldstyle: false })));
+                    }
                     if self.is("{") {
                         self.function_def(ty, &name, &attr);
                         break;
@@ -1651,8 +1689,17 @@ impl Parser {
         if self.consume(";") {
             return mk(NK::Nop, void, loc);
         }
-        if self.is("__asm__") || self.is("__asm") {
-            self.err("inline assembly is not supported");
+        if self.is_asm() {
+            // Only the empty template (an optimization barrier) is accepted.
+            self.pos += 1;
+            self.consume("volatile");
+            self.expect("(");
+            if self.tok().kind != TK::Str || !self.tok().bytes.is_empty() || !self.is_at(1, ")") {
+                self.err("inline assembly is not supported");
+            }
+            self.pos += 2;
+            self.expect(";");
+            return mk(NK::Nop, void, loc);
         }
         let e = self.expr();
         self.expect(";");
@@ -1806,11 +1853,11 @@ impl Parser {
     fn unary(&mut self) -> Node {
         let loc = self.loc();
         if self.consume("+") {
-            let e = self.cast();
+            let e = bf(self.cast());
             return new_cast(e.clone(), promote(&e.ty));
         }
         if self.consume("-") {
-            let e = self.cast();
+            let e = bf(self.cast());
             let ty = common_type(&ty_int(), &e.ty);
             if let NK::Num(v) = e.kind {
                 return mk(NK::Num(wrap(v.wrapping_neg(), &ty)), ty, loc);
@@ -1833,7 +1880,7 @@ impl Parser {
             return mk(NK::Not(bx(e)), ty_int(), loc);
         }
         if self.consume("~") {
-            let e = self.cast();
+            let e = bf(self.cast());
             let ty = promote(&e.ty);
             return mk(NK::BitNot(bx(new_cast(e, ty.clone()))), ty, loc);
         }
@@ -2067,9 +2114,17 @@ impl Parser {
                     }
                     "__builtin_va_end" => {
                         self.expect("(");
-                        self.assign();
+                        let ap = self.assign();
                         self.expect(")");
-                        return mk(NK::Nop, ty_void(), loc);
+                        return mk(NK::Cast(bx(ap)), ty_void(), loc);
+                    }
+                    "__builtin_constant_p" | "__builtin_prefetch" => {
+                        self.expect("(");
+                        while !self.consume(")") {
+                            self.assign();
+                            self.consume(",");
+                        }
+                        return num(0, loc);
                     }
                     "__builtin_va_copy" => {
                         self.expect("(");
@@ -2114,10 +2169,25 @@ impl Parser {
                     Some(VS::Global(i)) => self.gvar(i, loc),
                     Some(VS::Enum(v)) => num(v, loc),
                     _ if self.is("(") => {
-                        // Implicit function declaration (C89)
-                        eprintln!("{}:{}: warning: implicit declaration of function '{}'", crate::lex::file_name(loc.0), loc.1, t.s);
-                        let fty = Rc::new(Type::Func(Rc::new(FuncTy { ret: ty_int(), params: vec![], names: vec![], variadic: false, oldstyle: true })));
-                        let i = self.declare_func(&t.s, fty, &Attr::default());
+                        // Implicit function declaration (C89); `__builtin_foo` means libc's `foo`.
+                        let name = match t.s.strip_prefix("__builtin_") {
+                            Some("unreachable" | "trap") => "abort",
+                            Some(n) => n,
+                            None => {
+                                eprintln!("{}:{}: warning: implicit declaration of function '{}'", crate::lex::file_name(loc.0), loc.1, t.s);
+                                t.s.as_str()
+                            }
+                        };
+                        let ret = match name {
+                            "memset" | "memcpy" | "memmove" | "memchr" | "malloc" | "calloc" | "realloc" | "strcpy" | "strncpy"
+                            | "strcat" | "strncat" | "strchr" | "strrchr" | "strstr" => ptr_to(ty_char()),
+                            "strlen" => ty_ulong(),
+                            "abort" | "exit" | "free" => ty_void(),
+                            "fabs" | "sqrt" | "floor" | "ceil" | "pow" | "sin" | "cos" | "exp" | "log" | "inf" | "huge_val" | "nan" => ty_double(),
+                            _ => ty_int(),
+                        };
+                        let fty = Rc::new(Type::Func(Rc::new(FuncTy { ret, params: vec![], names: vec![], variadic: false, oldstyle: true })));
+                        let i = self.declare_func(name, fty, &Attr::default());
                         self.scopes[0].vars.insert(t.s.clone(), VS::Global(i));
                         self.gvar(i, loc)
                     }
