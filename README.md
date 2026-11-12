@@ -51,6 +51,11 @@ Tests:
     tests/torture.sh tests/ext/gcc-ts/gcc/testsuite/gcc.c-torture/execute
     tests/real.sh                             # Lua, SQLite, zlib, bzip2, chibicc, tinycc
 
+Publishing: `./push.sh` commits any uncommitted changes, one commit per part
+of the project (lexer, preprocessor, parser, codegen, driver, tests, docs), each
+with its own message, and pushes to GitHub (`origin`, by default
+`git@github.com:arturkhamit/rcc.git`). The build must succeed first.
+
 ## What is supported
 
 - C11: all statements and expressions, structs, unions, bitfields, enums,
