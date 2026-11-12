@@ -13,6 +13,7 @@ pub enum Type {
     Double,
     Ptr(Ty),
     Array(Ty, i64), // len < 0: incomplete
+    Vla(Ty, usize), // variable-length array; the local holding its byte size
     Func(Rc<FuncTy>),
     Struct(Rc<RefCell<SDef>>), // structs and unions
 }
@@ -48,7 +49,7 @@ impl Type {
             Type::Void | Type::Bool | Type::Func(_) => 1,
             Type::Int { size, .. } => *size as i64,
             Type::Float => 4,
-            Type::Double | Type::Ptr(_) => 8,
+            Type::Double | Type::Ptr(_) | Type::Vla(..) => 8, // a VLA variable is a pointer to its storage
             Type::Array(b, n) => if *n < 0 { 0 } else { b.size() * n },
             Type::Struct(s) => s.borrow().size,
         }
@@ -74,12 +75,12 @@ impl Type {
     }
     /// Unsigned for the purpose of comparison/division/shift (pointers compare unsigned).
     pub fn is_unsigned(&self) -> bool {
-        matches!(self, Type::Bool | Type::Int { unsigned: true, .. } | Type::Ptr(_) | Type::Array(..))
+        matches!(self, Type::Bool | Type::Int { unsigned: true, .. } | Type::Ptr(_) | Type::Array(..) | Type::Vla(..))
     }
     /// Pointee / element type of pointers and arrays.
     pub fn base(&self) -> Option<&Ty> {
         match self {
-            Type::Ptr(b) | Type::Array(b, _) => Some(b),
+            Type::Ptr(b) | Type::Array(b, _) | Type::Vla(b, _) => Some(b),
             _ => None,
         }
     }
@@ -117,7 +118,7 @@ pub fn promote(t: &Ty) -> Ty {
 /// Arrays and functions decay to pointers.
 pub fn decay(t: &Ty) -> Ty {
     match &**t {
-        Type::Array(b, _) => ptr_to(b.clone()),
+        Type::Array(b, _) | Type::Vla(b, _) => ptr_to(b.clone()),
         Type::Func(_) => ptr_to(t.clone()),
         _ => t.clone(),
     }

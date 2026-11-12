@@ -23,7 +23,6 @@ const PREDEFINED: &str = "
 #define __STDC_NO_ATOMICS__ 1
 #define __STDC_NO_COMPLEX__ 1
 #define __STDC_NO_THREADS__ 1
-#define __STDC_NO_VLA__ 1
 #define __STDC_UTF_16__ 1
 #define __STDC_UTF_32__ 1
 #define _LP64 1
@@ -56,6 +55,32 @@ const PREDEFINED: &str = "
 #define __INTPTR_TYPE__ long
 #define __UINTPTR_TYPE__ unsigned long
 #define __WCHAR_TYPE__ int
+#define __INT8_TYPE__ signed char
+#define __INT16_TYPE__ short
+#define __INT32_TYPE__ int
+#define __INT64_TYPE__ long
+#define __UINT8_TYPE__ unsigned char
+#define __UINT16_TYPE__ unsigned short
+#define __UINT32_TYPE__ unsigned int
+#define __UINT64_TYPE__ unsigned long
+#define __INT_LEAST8_TYPE__ signed char
+#define __INT_LEAST16_TYPE__ short
+#define __INT_LEAST32_TYPE__ int
+#define __INT_LEAST64_TYPE__ long
+#define __UINT_LEAST8_TYPE__ unsigned char
+#define __UINT_LEAST16_TYPE__ unsigned short
+#define __UINT_LEAST32_TYPE__ unsigned int
+#define __UINT_LEAST64_TYPE__ unsigned long
+#define __INTMAX_TYPE__ long
+#define __UINTMAX_TYPE__ unsigned long
+#define __CHAR16_TYPE__ unsigned short
+#define __CHAR32_TYPE__ unsigned int
+#define __FLT_MAX__ 3.40282347e+38F
+#define __FLT_MIN__ 1.17549435e-38F
+#define __FLT_EPSILON__ 1.19209290e-7F
+#define __DBL_MAX__ 1.7976931348623157e+308
+#define __DBL_MIN__ 2.2250738585072014e-308
+#define __DBL_EPSILON__ 2.2204460492503131e-16
 #define __WINT_TYPE__ unsigned int
 #define __SCHAR_MAX__ 127
 #define __SHRT_MAX__ 32767

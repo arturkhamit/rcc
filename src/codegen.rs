@@ -192,6 +192,9 @@ impl<'a> Gen<'a> {
         emit!(self, "  .text\n  .type {}, @function\n{}:", f.name, f.name);
         emit!(self, "  push %rbp\n  mov %rsp, %rbp\n  sub ${}, %rsp", align_to(bottom, 16));
 
+        for &v in &f.vla_saves {
+            emit!(self, "  movq $0, {}(%rbp)", self.offs[v]);
+        }
         if let Some(va) = f.va_area {
             // Register save area for va_arg.
             let off = self.offs[va];
@@ -274,6 +277,8 @@ impl<'a> Gen<'a> {
 
     fn gen_addr(&mut self, n: &Node) {
         match &n.kind {
+            // A VLA variable holds the address of its storage.
+            NK::LVar(i) if matches!(*n.ty, Type::Vla(..)) => emit!(self, "  mov {}(%rbp), %rax", self.offs[*i]),
             NK::LVar(i) => emit!(self, "  lea {}(%rbp), %rax", self.offs[*i]),
             NK::GVar(name) => {
                 if self.defined.contains(name.as_str()) {
@@ -305,7 +310,7 @@ impl<'a> Gen<'a> {
     fn load_from(&mut self, ty: &Ty, src: &str) {
         match &**ty {
             // Arrays, structs and functions are represented by their address.
-            Type::Array(..) | Type::Struct(_) | Type::Func(_) | Type::Void => {
+            Type::Array(..) | Type::Vla(..) | Type::Struct(_) | Type::Func(_) | Type::Void => {
                 if src != "(%rax)" {
                     emit!(self, "  lea {}, %rax", src);
                 }
@@ -348,6 +353,7 @@ impl<'a> Gen<'a> {
     /// Memory operand of a variable that can be addressed directly.
     fn direct(&self, n: &Node) -> Option<String> {
         match &n.kind {
+            NK::LVar(_) if matches!(*n.ty, Type::Vla(..)) => None,
             NK::LVar(i) => Some(format!("{}(%rbp)", self.offs[*i])),
             NK::GVar(name) if self.defined.contains(name.as_str()) => Some(format!("{}(%rip)", name)),
             _ => None,
@@ -502,6 +508,18 @@ impl<'a> Gen<'a> {
                 let f = self.func.unwrap();
                 emit!(self, "  mov ${}, %ecx\n  lea {}(%rbp), %rdi\n  mov $0, %al\n  rep stosb", f.locals[*i].ty.size(), self.offs[*i]);
             }
+            NK::Alloca(size) => {
+                self.gen_expr(size);
+                self.alloca();
+            }
+            NK::VlaAlloc { var, size, save } => {
+                // Reaching the declaration again frees the previous instance.
+                let (v, s) = (self.offs[*var], self.offs[*save]);
+                emit!(self, "  mov {}(%rbp), %rax\n  test %rax, %rax\n  je 1f\n  mov %rax, %rsp\n1:\n  mov %rsp, {}(%rbp)", s, s);
+                self.gen_expr(size);
+                self.alloca();
+                emit!(self, "  mov %rax, {}(%rbp)", v);
+            }
             NK::Cond(c, t, e) => {
                 let id = self.next();
                 self.gen_expr(c);
@@ -557,6 +575,13 @@ impl<'a> Gen<'a> {
             NK::Bin(op, l, r) => self.gen_bin(*op, l, r),
             _ => error_at(n.loc.0, n.loc.1, "statement used as an expression"),
         }
+    }
+
+    /// Allocates %rax bytes on the stack below the frame; the temporaries
+    /// currently pushed (`depth` words) are moved down to stay on top.
+    fn alloca(&mut self) {
+        emit!(self, "  add $15, %rax\n  and $-16, %rax\n  mov %rsp, %rsi\n  sub %rax, %rsp\n  mov %rsp, %rdi");
+        emit!(self, "  mov ${}, %ecx\n  rep movsq\n  mov %rdi, %rax", self.depth);
     }
 
     fn gen_bin(&mut self, op: Op, l: &Node, r: &Node) {

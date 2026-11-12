@@ -39,6 +39,8 @@ pub enum NK {
     Cast(Box<Node>),
     Call { f: Box<Node>, args: Vec<Node>, ret_buf: Option<usize> },
     MemZero(usize),
+    Alloca(Box<Node>),
+    VlaAlloc { var: usize, size: Box<Node>, save: usize },
     VaStart(Box<Node>),
     StmtExpr(Vec<Node>),
     // Statements
@@ -76,6 +78,7 @@ pub struct Obj {
     pub locals: Vec<Local>,
     pub body: Option<Node>,
     pub va_area: Option<usize>,
+    pub vla_saves: Vec<usize>, // locals remembering %rsp at VLA declarations
     pub refs: Vec<String>, // globals referenced by the function body
 }
 
@@ -211,12 +214,33 @@ fn arith(op: Op, l: Node, r: Node, loc: Loc) -> Node {
     mk(NK::Bin(op, bx(new_cast(l, ty.clone())), bx(new_cast(r, ty))), rty, loc)
 }
 
-fn scale(idx: Node, size: i64, loc: Loc) -> Node {
-    let idx = new_cast(idx, ty_long());
-    if let NK::Num(v) = idx.kind {
-        return lnum(v.wrapping_mul(size), loc);
+/// Size of a type as an expression (a runtime value for VLAs).
+fn size_of(ty: &Ty, loc: Loc) -> Node {
+    match &**ty {
+        Type::Vla(_, sv) => mk(NK::LVar(*sv), ty_ulong(), loc),
+        _ => mk(NK::Num(ty.size()), ty_ulong(), loc),
     }
-    mk(NK::Bin(Op::Mul, bx(idx), bx(lnum(size, loc))), ty_long(), loc)
+}
+
+/// Scales an index by the size of the pointee type.
+fn scale(idx: Node, base: &Ty, loc: Loc) -> Node {
+    let idx = new_cast(idx, ty_long());
+    let size = new_cast(size_of(base, loc), ty_long());
+    if let (NK::Num(v), NK::Num(sz)) = (&idx.kind, &size.kind) {
+        return lnum(v.wrapping_mul(*sz), loc);
+    }
+    mk(NK::Bin(Op::Mul, bx(idx), bx(size)), ty_long(), loc)
+}
+
+/// True for integer constant expressions (address constants excluded).
+fn is_const(n: &Node) -> bool {
+    match &n.kind {
+        NK::Num(_) | NK::FNum(_) => true,
+        NK::Bin(_, l, r) | NK::LogAnd(l, r) | NK::LogOr(l, r) => is_const(l) && is_const(r),
+        NK::Neg(l) | NK::Not(l) | NK::BitNot(l) | NK::Cast(l) => is_const(l),
+        NK::Cond(c, t, e) => is_const(c) && is_const(t) && is_const(e),
+        _ => false,
+    }
 }
 
 fn new_add(l: Node, r: Node, loc: Loc) -> Node {
@@ -228,7 +252,7 @@ fn new_add(l: Node, r: Node, loc: Loc) -> Node {
     if !r.ty.is_integer() {
         err(loc, "invalid operands");
     }
-    let r = scale(r, base.size(), loc);
+    let r = scale(r, &base, loc);
     mk(NK::Bin(Op::Add, bx(l), bx(r)), ptr_to(base), loc)
 }
 
@@ -238,14 +262,18 @@ fn new_sub(l: Node, r: Node, loc: Loc) -> Node {
     }
     let Some(base) = l.ty.base().cloned() else { err(loc, "invalid operands") };
     if r.ty.is_integer() {
-        let r = scale(r, base.size(), loc);
+        let r = scale(r, &base, loc);
         return mk(NK::Bin(Op::Sub, bx(l), bx(r)), ptr_to(base), loc);
     }
     if r.ty.base().is_none() {
         err(loc, "invalid operands");
     }
     let diff = mk(NK::Bin(Op::Sub, bx(l), bx(r)), ty_long(), loc);
-    mk(NK::Bin(Op::Div, bx(diff), bx(lnum(base.size().max(1), loc))), ty_long(), loc)
+    let size = match &*base {
+        Type::Vla(..) => new_cast(size_of(&base, loc), ty_long()),
+        _ => lnum(base.size().max(1), loc),
+    };
+    mk(NK::Bin(Op::Div, bx(diff), bx(size)), ty_long(), loc)
 }
 
 fn new_binary(op: Op, l: Node, r: Node, loc: Loc) -> Node {
@@ -275,7 +303,7 @@ fn new_addr(n: Node, loc: Loc) -> Node {
 }
 
 fn new_assign(l: Node, r: Node, loc: Loc) -> Node {
-    if let Type::Array(..) = &*l.ty {
+    if let Type::Array(..) | Type::Vla(..) = &*l.ty {
         err(loc, "not an lvalue");
     }
     let r = if l.ty.is_struct() { r } else { new_cast(r, l.ty.clone()) };
@@ -440,6 +468,9 @@ pub struct Parser {
     switches: Vec<SwitchCtx>,
     uniq: usize,
     va_elem: Ty,
+    vla_pending: Vec<Node>, // size computations of VLA types parsed so far
+    vla_saves: Vec<usize>,
+    in_params: usize,
 }
 
 pub fn parse(toks: Vec<Token>) -> Vec<Obj> {
@@ -483,6 +514,9 @@ fn new_parser(toks: Vec<Token>) -> Parser {
         switches: vec![],
         uniq: 0,
         va_elem: va_elem.clone(),
+        vla_pending: vec![],
+        vla_saves: vec![],
+        in_params: 0,
     };
     p.scopes[0].vars.insert("__builtin_va_list".into(), VS::Typedef(array_of(va_elem, 1)));
     p
@@ -596,6 +630,7 @@ impl Parser {
             locals: vec![],
             body: None,
             va_area: None,
+            vla_saves: vec![],
             refs: vec![],
         });
         self.gmap.insert(name, self.globals.len() - 1);
@@ -822,15 +857,55 @@ impl Parser {
             if self.is("*") && self.is_at(1, "]") {
                 self.pos += 1; // `[*]`: array of unspecified size in a prototype
             }
-            let len = if self.is("]") { -1 } else { self.const_expr() };
+            let (mut len, mut len_expr) = (-1, None);
+            if self.in_params > 0 && self.dim_uses_variables() {
+                // shortcut: a variable dimension in a parameter is dropped (correct for
+                // the outermost one, which decays to a pointer anyway).
+                while !self.is("]") {
+                    self.pos += 1;
+                }
+            } else if !self.is("]") {
+                let e = self.assign();
+                if is_const(&e) {
+                    len = eval(&e);
+                } else if self.scopes.len() == 1 {
+                    err(e.loc, "not a compile-time constant");
+                } else {
+                    len_expr = Some(e);
+                }
+            }
             self.expect("]");
             let ty = self.type_suffix(ty);
-            return array_of(ty, len);
+            let Some(e) = len_expr else { return array_of(ty, len) };
+            // VLA: compute its byte size into a hidden local.
+            let loc = e.loc;
+            let sv = self.new_lvar("", ty_ulong());
+            let size = new_binary(Op::Mul, new_cast(e, ty_ulong()), size_of(&ty, loc), loc);
+            self.vla_pending.push(new_assign(self.lvar(sv, loc), size, loc));
+            return Rc::new(Type::Vla(ty, sv));
         }
         ty
     }
 
+    /// True if the array dimension at the current position mentions a variable.
+    fn dim_uses_variables(&self) -> bool {
+        self.toks[self.pos..].iter().take_while(|t| !t.is("]")).any(|t| t.kind == TK::Ident && !matches!(self.find_var(&t.s), Some(VS::Enum(_) | VS::Typedef(_))))
+    }
+
+    /// Wraps an expression so that pending VLA size computations run first.
+    fn with_vla_sizes(&mut self, n: Node) -> Node {
+        let loc = n.loc;
+        std::mem::take(&mut self.vla_pending).into_iter().rev().fold(n, |acc, p| new_comma(p, acc, loc))
+    }
+
     fn func_params(&mut self, ret: Ty) -> Ty {
+        self.in_params += 1;
+        let ty = self.func_params2(ret);
+        self.in_params -= 1;
+        ty
+    }
+
+    fn func_params2(&mut self, ret: Ty) -> Ty {
         let (mut params, mut names, mut variadic) = (vec![], vec![], false);
         if self.is("void") && self.is_at(1, ")") {
             self.pos += 2;
@@ -1010,6 +1085,13 @@ impl Parser {
             if self.consume(";") {
                 continue;
             }
+            if self.is("[") && self.is_at(1, "[") {
+                while !(self.is("]") && self.is_at(1, "]")) {
+                    self.pos += 1; // [[attribute]]
+                }
+                self.pos += 2;
+                continue;
+            }
             if self.is("_Static_assert") || self.is_asm() {
                 self.skip_to_semi();
                 continue;
@@ -1092,6 +1174,8 @@ impl Parser {
 
         self.locals = vec![];
         self.refs = vec![];
+        self.vla_pending.clear();
+        self.vla_saves.clear();
         self.fn_name = name.to_string();
         self.ret_ty = fty.ret.clone();
         self.scopes.push(Scope::default());
@@ -1111,6 +1195,7 @@ impl Parser {
         let g = &mut self.globals[i];
         g.params = params;
         g.va_area = va_area;
+        g.vla_saves = std::mem::take(&mut self.vla_saves);
         g.locals = std::mem::take(&mut self.locals);
         g.refs = std::mem::take(&mut self.refs);
         g.body = Some(body);
@@ -1360,6 +1445,9 @@ impl Parser {
             }
             _ => {
                 if self.consume("{") {
+                    if self.consume("}") {
+                        return; // `{}`: zero
+                    }
                     self.initializer2(init);
                     self.consume(",");
                     self.expect("}");
@@ -1498,6 +1586,9 @@ impl Parser {
             let (ty, name) = self.declarator(base.clone());
             self.skip_attrs();
             let Some(name) = name else { self.err("variable name omitted") };
+            for e in std::mem::take(&mut self.vla_pending) {
+                out.push(mk(NK::ExprStmt(bx(e)), ty_void(), loc));
+            }
             if let Type::Func(_) = &*ty {
                 let i = self.declare_func(&name, ty, attr);
                 self.scope().vars.insert(name, VS::Global(i));
@@ -1519,7 +1610,14 @@ impl Parser {
             if let Type::Void = &*ty {
                 self.err("variable declared void");
             }
-            let l = self.new_lvar(&name, ty);
+            let l = self.new_lvar(&name, ty.clone());
+            if let Type::Vla(_, sv) = &*ty {
+                let save = self.new_lvar("", ty_ulong());
+                self.vla_saves.push(save);
+                let alloc = NK::VlaAlloc { var: l, size: bx(self.lvar(*sv, loc)), save };
+                out.push(mk(NK::ExprStmt(bx(mk(alloc, ty_void(), loc))), ty_void(), loc));
+                continue;
+            }
             if self.consume("=") {
                 let e = self.lvar_initializer(l);
                 out.push(mk(NK::ExprStmt(bx(e)), ty_void(), loc));
@@ -1543,6 +1641,9 @@ impl Parser {
                 let base = self.declspec(Some(&mut attr));
                 if attr.is_typedef {
                     self.parse_typedef(base);
+                    for e in std::mem::take(&mut self.vla_pending) {
+                        v.push(mk(NK::ExprStmt(bx(e)), ty_void(), loc));
+                    }
                 } else {
                     v.push(self.declaration(base, &attr));
                 }
@@ -1845,7 +1946,7 @@ impl Parser {
             if e.ty.is_struct() {
                 err(loc, "invalid cast");
             }
-            return new_cast(e, ty);
+            return self.with_vla_sizes(new_cast(e, ty));
         }
         self.unary()
     }
@@ -1902,7 +2003,7 @@ impl Parser {
             } else {
                 self.unary().ty
             };
-            return mk(NK::Num(ty.size()), ty_ulong(), loc);
+            return self.with_vla_sizes(size_of(&ty, loc));
         }
         if self.consume("_Alignof") || self.consume("__alignof__") {
             self.expect("(");
@@ -1916,6 +2017,17 @@ impl Parser {
     /// `n++` / `n--` : (typeof n)((n += d) - d)
     fn inc_dec(&mut self, n: Node, d: i64, loc: Loc) -> Node {
         let ty = n.ty.clone();
+        if let NK::Member(base, m) = &n.kind {
+            if m.bit_width >= 0 {
+                // p = &base, old = p->m, p->m = old + d, old
+                let (p, old) = (self.new_lvar("", ptr_to(base.ty.clone())), self.new_lvar("", ty));
+                let mem = new_member(new_deref(self.lvar(p, loc), loc), m, loc);
+                let set = new_assign(self.lvar(p, loc), new_addr((**base).clone(), loc), loc);
+                let save = new_assign(self.lvar(old, loc), mem.clone(), loc);
+                let upd = new_assign(mem, new_add(self.lvar(old, loc), num(d, loc), loc), loc);
+                return new_comma(set, new_comma(save, new_comma(upd, self.lvar(old, loc), loc), loc), loc);
+            }
+        }
         let a = self.op_assign(Op::Add, n, num(d, loc), loc);
         new_cast(new_add(a, num(-d, loc), loc), ty)
     }
@@ -2135,6 +2247,12 @@ impl Parser {
                         return new_assign(new_deref(d, loc), new_deref(s, loc), loc);
                     }
                     "__builtin_va_arg" => return self.va_arg(loc),
+                    "alloca" | "__builtin_alloca" if self.is("(") => {
+                        self.pos += 1;
+                        let size = new_cast(self.assign(), ty_ulong());
+                        self.expect(")");
+                        return mk(NK::Alloca(bx(size)), ptr_to(ty_void()), loc);
+                    }
                     "__builtin_expect" => {
                         self.expect("(");
                         let e = self.assign();
@@ -2183,7 +2301,7 @@ impl Parser {
                             | "strcat" | "strncat" | "strchr" | "strrchr" | "strstr" => ptr_to(ty_char()),
                             "strlen" => ty_ulong(),
                             "abort" | "exit" | "free" => ty_void(),
-                            "fabs" | "sqrt" | "floor" | "ceil" | "pow" | "sin" | "cos" | "exp" | "log" | "inf" | "huge_val" | "nan" => ty_double(),
+                            "fabs" | "sqrt" | "floor" | "ceil" | "pow" | "sin" | "cos" | "exp" | "log" | "inf" | "huge_val" | "nan" | "copysign" | "fmod" => ty_double(),
                             _ => ty_int(),
                         };
                         let fty = Rc::new(Type::Func(Rc::new(FuncTy { ret, params: vec![], names: vec![], variadic: false, oldstyle: true })));
