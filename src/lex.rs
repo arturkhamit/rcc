@@ -62,7 +62,7 @@ const KEYWORDS: &[&str] = &[
     "_Alignof", "_Alignas", "do", "signed", "unsigned", "const", "volatile", "auto", "register", "restrict",
     "__restrict", "__restrict__", "_Noreturn", "float", "double", "typeof", "__typeof__", "__typeof", "inline",
     "__inline", "__inline__", "_Thread_local", "__thread", "_Atomic", "__attribute__", "__asm__", "__asm", "asm",
-    "__signed__", "__signed", "__const", "__volatile__", "__volatile", "_Static_assert", "__alignof__",
+    "__signed__", "__signed", "__const", "__volatile__", "__volatile", "_Static_assert", "__alignof__", "__alignof",
     "_Generic", "__label__",
 ];
 
@@ -232,13 +232,17 @@ pub fn tokenize(src: &[u8], file: u32) -> Vec<Token> {
             t.kind = TK::PPNum;
         } else if p[q] == b'"' {
             i = q + 1;
+            let mut closed = true;
             loop {
                 let d = p[i];
                 if d == b'"' {
                     break;
                 }
                 if d == b'\n' || i >= n {
-                    error_at(file, line, "unclosed string literal");
+                    // Not an error yet: this may be in a skipped #if group or an
+                    // #error line. The lone quote becomes a token no parser accepts.
+                    closed = false;
+                    break;
                 }
                 let v = if d == b'\\' {
                     i += 1;
@@ -255,9 +259,14 @@ pub fn tokenize(src: &[u8], file: u32) -> Vec<Token> {
                     t.bytes.push(v as u8);
                 }
             }
-            i += 1;
-            t.kind = TK::Str;
-            t.ival = if wide { 4 } else { 1 };
+            if closed {
+                i += 1;
+                t.kind = TK::Str;
+                t.ival = if wide { 4 } else { 1 };
+            } else {
+                i = q + 1;
+                t.bytes.clear();
+            }
         } else if p[q] == b'\'' {
             i = q + 1;
             let v = if p[i] == b'\\' {
@@ -266,15 +275,16 @@ pub fn tokenize(src: &[u8], file: u32) -> Vec<Token> {
             } else {
                 read_utf8(&p, &mut i)
             };
-            while p[i] != b'\'' {
-                if p[i] == b'\n' || i >= n {
-                    error_at(file, line, "unclosed char literal");
-                }
+            while p[i] != b'\'' && p[i] != b'\n' && i < n {
                 i += 1;
             }
-            i += 1;
-            t.kind = TK::Num;
-            t.ival = if wide { v as i64 } else { v as u8 as i8 as i64 };
+            if p[i] == b'\'' {
+                i += 1;
+                t.kind = TK::Num;
+                t.ival = if wide { v as i64 } else { v as u8 as i8 as i64 };
+            } else {
+                i = q + 1; // unclosed: a lone quote token, as for strings
+            }
         } else if is_ident1(c) {
             while is_ident2(p[i]) {
                 i += 1;
@@ -425,7 +435,8 @@ fn parse_f80(body: &str) -> (u64, u16) {
 }
 
 fn convert_float(t: &mut Token, s: &str) {
-    let (body, nty) = if let Some(b) = s.strip_suffix('f').filter(|_| !s.starts_with("0x")) {
+    // In a hexadecimal constant `f` is a digit, except after the exponent.
+    let (body, nty) = if let Some(b) = s.strip_suffix('f').filter(|_| !s.starts_with("0x") || s.contains('p')) {
         (b, NumTy::Float)
     } else if let Some(b) = s.strip_suffix('l') {
         (b, NumTy::LDouble)
@@ -471,6 +482,9 @@ pub fn convert(toks: Vec<Token>) -> Vec<Token> {
             TK::Ident => {
                 if t.s == "__extension__" {
                     continue;
+                }
+                if t.s == "__attribute" {
+                    t.s = "__attribute__".to_string();
                 }
                 if KEYWORDS.contains(&t.s.as_str()) {
                     t.kind = TK::Keyword;

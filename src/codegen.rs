@@ -3,7 +3,7 @@
 use crate::lex::error_at;
 use crate::parse::{Node, Obj, Op, NK};
 use crate::types::*;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
 
 const ARG8: [&str; 6] = ["%dil", "%sil", "%dl", "%cl", "%r8b", "%r9b"];
@@ -33,6 +33,9 @@ fn in_regs(ty: &Ty, gp: &mut usize, fp: &mut usize) -> bool {
         Type::Struct(_) => {
             if mem_class(ty) || has_ldouble(ty) {
                 return false;
+            }
+            if ty.size() == 0 {
+                return true; // GNU empty struct: takes no register and no stack
             }
             let f1 = has_flonum(ty, 0, 8, 0) as usize;
             let f2 = if ty.size() > 8 { has_flonum(ty, 8, 16, 0) as usize } else { 0 };
@@ -68,38 +71,61 @@ struct Gen<'a> {
     func: Option<&'a Obj>,
     offs: Vec<i64>,
     va: (usize, usize, i64), // gp regs used, fp regs used, start of stack args
+    has_asm: bool,           // the current function contains an asm statement
 }
 
-pub fn codegen(globals: &[Obj]) -> String {
-    let mut g = Gen { out: String::new(), depth: 0, cnt: 0, defined: HashSet::new(), tls: HashSet::new(), func: None, offs: vec![], va: (0, 0, 0) };
+/// `pic`: the code may go into a shared library, where a global symbol can be
+/// preempted and so must be reached through the GOT even if defined here.
+pub fn codegen(globals: &[Obj], top_asm: &[String], pic: bool) -> String {
+    let mut g = Gen { out: String::new(), depth: 0, cnt: 0, defined: HashSet::new(), tls: HashSet::new(), func: None, offs: vec![], va: (0, 0, 0), has_asm: false };
     g.tls = globals.iter().filter(|o| o.is_tls).map(|o| o.name.as_str()).collect();
-    g.defined = globals.iter().filter(|o| o.is_def).map(|o| o.name.as_str()).collect();
+    g.defined = globals.iter().filter(|o| o.is_def && (o.is_static || !pic)).map(|o| o.name.as_str()).collect();
 
-    // Static functions are emitted only if reachable from something emitted.
+    // Every function is generated, but a static one is kept only if code that is
+    // kept refers to it. Going by the generated text rather than by the source
+    // lets calls in eliminated dead code drop their callees too.
+    let mut texts: HashMap<&str, String> = HashMap::new();
+    for o in globals.iter().filter(|o| o.is_def && o.is_func) {
+        g.emit_func(o);
+        texts.insert(&o.name, std::mem::take(&mut g.out));
+    }
+    let statics: HashSet<&str> = globals.iter().filter(|o| o.is_def && o.is_func && o.is_static).map(|o| o.name.as_str()).collect();
     let mut live: HashSet<&str> = HashSet::new();
     let mut work: Vec<&str> = Vec::new();
     for o in globals.iter().filter(|o| o.is_def) {
         if !o.is_func {
             // A relocation against a label (`&&l` in a static table) keeps its function.
             work.extend(o.relocs.iter().map(|r| r.label.strip_prefix(".L.u.").and_then(|l| l.split('.').next()).unwrap_or(&r.label)));
-        } else if !o.is_static {
+        } else if !o.is_static || o.sym.ctor || o.sym.dtor {
             work.push(&o.name);
         }
     }
+    work.extend(globals.iter().filter_map(|o| o.sym.alias.as_deref()));
     while let Some(name) = work.pop() {
         if !live.insert(name) {
             continue;
         }
-        if let Some(o) = globals.iter().find(|o| o.name == name && o.is_func) {
-            work.extend(o.refs.iter().map(|s| s.as_str()));
+        if let Some(text) = texts.get(name) {
+            let words = text.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '$'));
+            work.extend(words.filter_map(|w| statics.get(w).copied()));
         }
     }
 
+    for text in top_asm {
+        emit!(g, "{}", text);
+    }
+    for o in globals {
+        if let Some(target) = &o.sym.alias {
+            emit!(g, "  .{} {}\n  .set {}, {}", if o.sym.weak { "weak" } else if o.is_static { "local" } else { "globl" }, o.name, o.name, target);
+        } else if o.sym.weak && !o.is_def {
+            emit!(g, "  .weak {}", o.name); // may stay undefined
+        }
+    }
     for o in globals.iter().filter(|o| o.is_def && !o.is_func) {
         g.emit_data(o);
     }
     for o in globals.iter().filter(|o| o.is_def && o.is_func && live.contains(o.name.as_str())) {
-        g.emit_func(o);
+        g.out.push_str(&texts[o.name.as_str()]);
     }
     emit!(g, "  .section .note.GNU-stack,\"\",@progbits");
     g.out
@@ -151,13 +177,33 @@ impl<'a> Gen<'a> {
         let align = if matches!(&*o.ty, Type::Array(..)) && size >= 16 { o.ty.align().max(16) } else { o.ty.align() };
         let align = align.max(o.align);
         if !o.name.starts_with(".L") {
-            emit!(self, "  .{} {}", if o.is_static { "local" } else { "globl" }, o.name);
+            self.emit_binding(o);
         }
-        let Some(data) = &o.init else {
+        if let Some(sec) = &o.sym.section {
+            emit!(self, "  .section {},\"aw\",@progbits\n  .balign {}\n{}:", sec, align, o.name);
+            match &o.init {
+                Some(_) => self.emit_bytes(o),
+                None => emit!(self, "  .zero {}", size),
+            }
+            return;
+        }
+        if o.init.is_none() {
             emit!(self, "  {}\n  .balign {}\n{}:\n  .zero {}", if o.is_tls { ".section .tbss,\"awT\",@nobits" } else { ".bss" }, align, o.name, size);
             return;
-        };
+        }
         emit!(self, "  {}\n  .balign {}\n{}:", if o.is_tls { ".section .tdata,\"awT\",@progbits" } else { ".data" }, align, o.name);
+        self.emit_bytes(o);
+    }
+
+    fn emit_binding(&mut self, o: &Obj) {
+        emit!(self, "  .{} {}", if o.sym.weak { "weak" } else if o.is_static { "local" } else { "globl" }, o.name);
+        if o.sym.hidden {
+            emit!(self, "  .hidden {}", o.name);
+        }
+    }
+
+    fn emit_bytes(&mut self, o: &Obj) {
+        let data = o.init.as_ref().unwrap();
         let (mut pos, mut ri) = (0usize, 0usize);
         while pos < data.len() {
             if ri < o.relocs.len() && o.relocs[ri].offset as usize == pos {
@@ -185,6 +231,8 @@ impl<'a> Gen<'a> {
     fn emit_func(&mut self, f: &'a Obj) {
         let Type::Func(fty) = &*f.ty else { unreachable!() };
         self.func = Some(f);
+        self.has_asm = false;
+        let start = self.out.len();
 
         // Assign stack offsets to parameters and locals.
         self.offs = vec![0; f.locals.len()];
@@ -215,8 +263,15 @@ impl<'a> Gen<'a> {
             self.offs[i] = -bottom;
         }
 
-        emit!(self, "  .{} {}", if f.is_static { "local" } else { "globl" }, f.name);
-        emit!(self, "  .text\n  .type {}, @function\n{}:", f.name, f.name);
+        self.emit_binding(f);
+        match &f.sym.section {
+            Some(sec) => emit!(self, "  .section {},\"ax\",@progbits", sec),
+            None => emit!(self, "  .text"),
+        }
+        if f.align > 1 {
+            emit!(self, "  .balign {}", f.align);
+        }
+        emit!(self, "  .type {}, @function\n{}:", f.name, f.name);
         emit!(self, "  push %rbp\n  mov %rsp, %rbp\n  sub ${}, %rsp", align_to(bottom, 16));
 
         for &v in &f.vla_saves {
@@ -275,6 +330,16 @@ impl<'a> Gen<'a> {
         }
         emit!(self, ".L.return.{}:\n  mov %rbp, %rsp\n  pop %rbp\n  ret", f.name);
         emit!(self, "  .size {}, .-{}", f.name, f.name);
+        if !self.has_asm {
+            let text = crate::opt::remove_dead_code(&self.out[start..]);
+            self.out.truncate(start);
+            self.out.push_str(&text);
+        }
+        for (on, sec) in [(f.sym.ctor, "init"), (f.sym.dtor, "fini")] {
+            if on {
+                emit!(self, "  .section .{}_array,\"aw\",@{}_array\n  .balign 8\n  .quad {}", sec, sec, f.name);
+            }
+        }
     }
 
     fn store_fp(&mut self, r: usize, off: i64, size: i64) {
@@ -593,9 +658,7 @@ impl<'a> Gen<'a> {
             }
             NK::Cond(c, t, e) => {
                 let id = self.next();
-                self.gen_expr(c);
-                self.cmp_zero(&c.ty);
-                emit!(self, "  je .L.else.{}", id);
+                self.gen_branch(c, &format!(".L.else.{}", id), false);
                 self.gen_expr(t);
                 emit!(self, "  jmp .L.end.{}\n.L.else.{}:", id, id);
                 self.gen_expr(e);
@@ -610,16 +673,10 @@ impl<'a> Gen<'a> {
                 self.gen_expr(l);
                 emit!(self, "  not %rax");
             }
-            NK::LogAnd(l, r) | NK::LogOr(l, r) => {
+            NK::LogAnd(..) | NK::LogOr(..) => {
                 let id = self.next();
-                let (jmp, short) = if let NK::LogAnd(..) = n.kind { ("je", 0) } else { ("jne", 1) };
-                self.gen_expr(l);
-                self.cmp_zero(&l.ty);
-                emit!(self, "  {} .L.short.{}", jmp, id);
-                self.gen_expr(r);
-                self.cmp_zero(&r.ty);
-                emit!(self, "  {} .L.short.{}", jmp, id);
-                emit!(self, "  mov ${}, %eax\n  jmp .L.end.{}\n.L.short.{}:\n  mov ${}, %eax\n.L.end.{}:", 1 - short, id, id, short, id);
+                self.gen_branch(n, &format!(".L.false.{}", id), false);
+                emit!(self, "  mov $1, %eax\n  jmp .L.end.{}\n.L.false.{}:\n  mov $0, %eax\n.L.end.{}:", id, id, id);
             }
             NK::Cast(l) => {
                 self.gen_expr(l);
@@ -651,6 +708,63 @@ impl<'a> Gen<'a> {
             NK::Call { f, args, ret_buf } => self.gen_call(n, f, args, *ret_buf),
             NK::Bin(op, l, r) => self.gen_bin(*op, l, r),
             _ => error_at(n.loc.0, n.loc.1, "statement used as an expression"),
+        }
+    }
+
+    /// Jumps to `label` if the truth value of `n` is `when`, and falls through
+    /// otherwise. A constant condition gives an unconditional jump or nothing,
+    /// which lets the dead-code pass drop the branch not taken.
+    fn gen_branch(&mut self, n: &Node, label: &str, when: bool) {
+        match &n.kind {
+            NK::Num(v) => {
+                if (*v != 0) == when {
+                    emit!(self, "  jmp {}", label);
+                }
+            }
+            NK::Not(l) => self.gen_branch(l, label, !when),
+            NK::Comma(l, r) => {
+                self.gen_void(l);
+                self.gen_branch(r, label, when);
+            }
+            // `a && b` is false as soon as one operand is; `a || b` true likewise.
+            NK::LogAnd(l, r) | NK::LogOr(l, r) => {
+                let is_and = matches!(n.kind, NK::LogAnd(..));
+                if is_and != when {
+                    self.gen_branch(l, label, when);
+                    self.gen_branch(r, label, when);
+                } else {
+                    let skip = format!(".L.skip.{}", self.next());
+                    self.gen_branch(l, &skip, !when);
+                    self.gen_branch(r, label, when);
+                    emit!(self, "{}:", skip);
+                }
+            }
+            NK::Bin(op @ (Op::Eq | Op::Ne | Op::Lt | Op::Le), l, r) if !l.ty.is_flonum() => {
+                self.gen_expr(r);
+                self.push();
+                self.gen_expr(l);
+                self.pop("%rdi");
+                let wide = l.ty.size() == 8 || l.ty.base().is_some();
+                emit!(self, "  cmp {}", if wide { "%rdi, %rax" } else { "%edi, %eax" });
+                let cc = match (op, l.ty.is_unsigned(), when) {
+                    (Op::Eq, _, true) | (Op::Ne, _, false) => "e",
+                    (Op::Eq, _, false) | (Op::Ne, _, true) => "ne",
+                    (Op::Lt, false, true) => "l",
+                    (Op::Lt, false, false) => "ge",
+                    (Op::Lt, true, true) => "b",
+                    (Op::Lt, true, false) => "ae",
+                    (_, false, true) => "le",
+                    (_, false, false) => "g",
+                    (_, true, true) => "be",
+                    (_, true, false) => "a",
+                };
+                emit!(self, "  j{} {}", cc, label);
+            }
+            _ => {
+                self.gen_expr(n);
+                self.cmp_zero(&n.ty);
+                emit!(self, "  {} {}", if when { "jne" } else { "je" }, label);
+            }
         }
     }
 
@@ -921,9 +1035,7 @@ impl<'a> Gen<'a> {
             }
             NK::If(c, t, e) => {
                 let id = self.next();
-                self.gen_expr(c);
-                self.cmp_zero(&c.ty);
-                emit!(self, "  je .L.else.{}", id);
+                self.gen_branch(c, &format!(".L.else.{}", id), false);
                 self.gen_stmt(t);
                 emit!(self, "  jmp .L.end.{}\n.L.else.{}:", id, id);
                 if let Some(e) = e {
@@ -938,9 +1050,7 @@ impl<'a> Gen<'a> {
                 }
                 emit!(self, ".L.begin.{}:", id);
                 if let Some(c) = cond {
-                    self.gen_expr(c);
-                    self.cmp_zero(&c.ty);
-                    emit!(self, "  je {}", brk);
+                    self.gen_branch(c, brk, false);
                 }
                 self.gen_stmt(body);
                 emit!(self, "{}:", cont);
@@ -954,9 +1064,8 @@ impl<'a> Gen<'a> {
                 emit!(self, ".L.begin.{}:", id);
                 self.gen_stmt(body);
                 emit!(self, "{}:", cont);
-                self.gen_expr(cond);
-                self.cmp_zero(&cond.ty);
-                emit!(self, "  jne .L.begin.{}\n{}:", id, brk);
+                self.gen_branch(cond, &format!(".L.begin.{}", id), true);
+                emit!(self, "{}:", brk);
             }
             NK::Switch { cond, body, cases, default, brk } => {
                 self.gen_expr(cond);
@@ -990,6 +1099,10 @@ impl<'a> Gen<'a> {
                 self.gen_stmt(body);
             }
             NK::Goto(l) => emit!(self, "  jmp {}", l),
+            NK::Asm(text) => {
+                self.has_asm = true;
+                emit!(self, "  {}", text);
+            }
             NK::GotoExpr(e) => {
                 self.gen_expr(e);
                 emit!(self, "  jmp *%rax");

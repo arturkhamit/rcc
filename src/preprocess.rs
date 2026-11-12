@@ -114,6 +114,7 @@ pub struct Preprocessor {
     counter: i64,
     depth: usize,
     pub prelude: Vec<Token>, // tokens of include/builtins.h
+    base_file: String,
 }
 
 fn err(t: &Token, msg: &str) -> ! {
@@ -150,7 +151,7 @@ impl Preprocessor {
             include_paths.push(d.to_string());
         }
         include_paths.extend(after_paths);
-        let mut pp = Preprocessor { macros: HashMap::new(), conds: vec![], include_paths, once: HashSet::new(), pushed: HashMap::new(), counter: 0, depth: 0, prelude: vec![] };
+        let mut pp = Preprocessor { macros: HashMap::new(), conds: vec![], include_paths, once: HashSet::new(), pushed: HashMap::new(), counter: 0, depth: 0, prelude: vec![], base_file: String::new() };
         let mut inp = tokenize(PREDEFINED.as_bytes(), add_file("<built-in>"));
         inp.reverse();
         pp.process(&mut inp, &mut vec![]);
@@ -180,6 +181,7 @@ impl Preprocessor {
             eprintln!("rcc: {}: {}", path, e);
             std::process::exit(1)
         });
+        self.base_file = path.to_string();
         let mut inp = tokenize(&src, add_file(path));
         inp.reverse();
         let mut out = vec![];
@@ -191,7 +193,7 @@ impl Preprocessor {
     }
 
     fn is_defined(&self, name: &str) -> bool {
-        self.macros.contains_key(name) || matches!(name, "__FILE__" | "__LINE__" | "__COUNTER__" | "__DATE__" | "__TIME__")
+        self.macros.contains_key(name) || matches!(name, "__FILE__" | "__LINE__" | "__COUNTER__" | "__DATE__" | "__TIME__" | "__BASE_FILE__" | "__INCLUDE_LEVEL__" | "__TIMESTAMP__")
     }
 
     fn process(&mut self, inp: &mut Vec<Token>, out: &mut Vec<Token>) {
@@ -385,14 +387,16 @@ impl Preprocessor {
 
     fn include(&mut self, inp: &mut Vec<Token>, d: &Token) {
         let mut line = read_line(inp);
-        if line.first().is_some_and(|t| t.kind == TK::Ident) {
+        let computed = line.first().is_some_and(|t| t.kind == TK::Ident);
+        if computed {
             line = self.expand_all(line); // #include MACRO
         }
         let (name, quote) = match line.first() {
             Some(t) if t.kind == TK::Str => (t.s[1..t.s.len() - 1].to_string(), true),
             Some(t) if t.is("<") => {
                 let Some(end) = line.iter().position(|t| t.is(">")) else { err(d, "expected '>'") };
-                (line[1..end].iter().map(|t| if t.space { format!(" {}", t.s) } else { t.s.clone() }).collect::<String>().trim().to_string(), false)
+                // Like GCC, a name built by macro expansion is glued without spaces.
+                (line[1..end].iter().map(|t| if t.space && !computed { format!(" {}", t.s) } else { t.s.clone() }).collect::<String>().trim().to_string(), false)
             }
             _ => err(d, "expected a file name"),
         };
@@ -518,6 +522,9 @@ impl Preprocessor {
                     self.counter += 1;
                     (self.counter - 1).to_string()
                 }
+                "__BASE_FILE__" => format!("{:?}", self.base_file),
+                "__INCLUDE_LEVEL__" => self.depth.to_string(),
+                "__TIMESTAMP__" => "\"Thu Jan  1 00:00:00 1970\"".to_string(),
                 "__DATE__" => "\"Jan  1 1970\"".to_string(),
                 "__TIME__" => "\"00:00:00\"".to_string(),
                 _ => return false,

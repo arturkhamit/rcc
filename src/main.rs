@@ -1,5 +1,6 @@
 mod codegen;
 mod lex;
+mod opt;
 mod parse;
 mod preprocess;
 mod types;
@@ -25,6 +26,7 @@ struct Opts {
     after_paths: Vec<String>,     // -idirafter
     defines: Vec<(bool, String)>, // (is -D, argument)
     includes: Vec<String>,        // -include
+    pic: bool,                    // -fPIC or -shared
 }
 
 /// Returns the tokens of the builtin prelude and of the translation unit.
@@ -49,8 +51,8 @@ fn compile(path: &str, opts: &Opts) -> String {
     let (mut toks, unit) = preprocess(path, opts);
     toks.extend(unit);
     let toks = lex::convert(toks);
-    let globals = parse::parse(toks);
-    codegen::codegen(&globals)
+    let (globals, top_asm) = parse::parse(toks);
+    codegen::codegen(&globals, &top_asm, opts.pic)
 }
 
 fn with_ext(path: &str, ext: &str) -> String {
@@ -86,7 +88,8 @@ fn main() {
     let (mut dep_on, mut dep_only, mut dep_system, mut dep_phony) = (false, false, true, false);
     let (mut dep_file, mut dep_target) = (None::<String>, None::<String>);
     let mut link: Vec<String> = vec![]; // objects, libraries and linker options, in order
-    let mut inputs: Vec<(usize, String)> = vec![]; // (position in `link`, source file)
+    let mut inputs: Vec<(usize, String, bool)> = vec![]; // (position in `link`, source file, is C)
+    let mut force_c = false; // after `-x c`
     let mut opts = Opts::default();
     let mut temps: Vec<String> = vec![];
     let mut i = 0;
@@ -110,7 +113,7 @@ fn main() {
                 "-include" => opts.includes.push(v),
                 "-MF" => dep_file = Some(v),
                 "-MT" | "-MQ" => dep_target = Some(v),
-                "-x" => {} // shortcut: every source is treated as C
+                "-x" => force_c = v == "c", // other languages: decided by the file name
                 "-L" | "-l" => link.push(format!("{}{}", opt, v)),
                 _ => link.extend([opt.to_string(), v]),
             }
@@ -141,16 +144,21 @@ fn main() {
                 std::io::Read::read_to_end(&mut std::io::stdin(), &mut src).unwrap_or_else(|e| die(&format!("stdin: {}", e)));
                 std::fs::write(&path, src).unwrap_or_else(|e| die(&format!("{}: {}", path, e)));
                 temps.push(path.clone());
-                inputs.push((link.len(), path.clone()));
+                inputs.push((link.len(), path.clone(), true));
                 link.push(path);
             }
-            "-s" | "-static" | "-shared" | "-pthread" | "-rdynamic" | "-pie" | "-no-pie" | "-nostdlib" | "-nostartfiles" | "-nodefaultlibs"
+            "-fPIC" | "-fpic" => opts.pic = true,
+            "-shared" => {
+                opts.pic = true;
+                link.push(a.to_string());
+            }
+            "-s" | "-static" | "-pthread" | "-rdynamic" | "-pie" | "-no-pie" | "-nostdlib" | "-nostartfiles" | "-nodefaultlibs"
             | "-static-libgcc" | "-static-pie" => link.push(a.to_string()),
             _ if a.starts_with("-Wl,") => link.push(a.to_string()),
             _ if a.starts_with('-') => {} // -O2, -g, -W..., -std=..., -f..., -m...: ignored
             _ => {
-                if a.ends_with(".c") || a.ends_with(".s") || a.ends_with(".S") {
-                    inputs.push((link.len(), a.to_string()));
+                if force_c || a.ends_with(".c") || a.ends_with(".s") || a.ends_with(".S") {
+                    inputs.push((link.len(), a.to_string(), force_c || a.ends_with(".c")));
                 }
                 link.push(a.to_string());
             }
@@ -165,10 +173,10 @@ fn main() {
         die("cannot specify -o with -c, -S or -E with multiple files");
     }
 
-    for (n, (slot, input)) in inputs.iter().enumerate() {
+    for (n, (slot, input, is_c)) in inputs.iter().enumerate() {
         let tmp = |ext: &str| format!("{}/rcc-{}-{}.{}", std::env::temp_dir().display(), std::process::id(), n, ext);
         let obj = if opt_c { out.clone().unwrap_or_else(|| with_ext(input, "o")) } else { tmp("o") };
-        if !input.ends_with(".c") {
+        if !is_c {
             // Assembly sources go to the system assembler (through cc, for .S).
             if opt_c {
                 run(Command::new("cc").args(["-c", "-o", &obj, input]));
