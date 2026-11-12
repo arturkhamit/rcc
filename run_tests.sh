@@ -19,5 +19,18 @@ run_one() {
 }
 export -f run_one; export RCC tmp
 ls tests/c-testsuite/tests/single-exec/*.c tests/local/*.c 2>/dev/null | xargs -P 8 -I{} bash -c 'run_one {}' | sort > "$tmp/res"
+# ABI: objects compiled by rcc and by gcc must call each other (tests/interop).
+I=tests/interop
+if gcc -w -c $I/callee.c -o $tmp/callee.g.o && gcc -w -c $I/caller.c -o $tmp/caller.g.o && gcc $tmp/callee.g.o $tmp/caller.g.o -o $tmp/interop && $tmp/interop > $tmp/interop.exp; then
+  "$RCC" -c $I/callee.c -o $tmp/callee.r.o 2>$tmp/interop.err; "$RCC" -c $I/caller.c -o $tmp/caller.r.o 2>>$tmp/interop.err
+  for pair in "callee.r caller.g" "callee.g caller.r" "callee.r caller.r"; do
+    set -- $pair
+    if gcc $tmp/$1.o $tmp/$2.o -o $tmp/interop 2>>$tmp/interop.err && $tmp/interop 2>&1 | cmp -s - $tmp/interop.exp; then
+      echo "ok interop $pair" >> "$tmp/res"
+    else
+      echo "FAIL(interop) $pair $(head -1 $tmp/interop.err)" >> "$tmp/res"
+    fi
+  done
+fi
 grep -c '^ok' "$tmp/res" | xargs -I{} echo "passed {}/$(wc -l < "$tmp/res")"
 grep -v '^ok' "$tmp/res" | sed 's|tests/c-testsuite/tests/single-exec/||' | { [ "$1" = -v ] && cat || cut -c1-110; } | head -${MAXFAIL:-40}

@@ -287,6 +287,11 @@ impl Preprocessor {
                             }
                             None => {}
                         },
+                        // Passed on to the parser as `__pragma_pack ( ... )`.
+                        "pack" => {
+                            out.push(make_token("__pragma_pack", &d));
+                            out.extend(line.into_iter().skip(1));
+                        }
                         _ => {}
                     }
                 }
@@ -475,6 +480,11 @@ impl Preprocessor {
             }
         }
         let body = read_line(inp);
+        // glibc defines `__attribute__(x)` away for non-GNU compilers; rcc understands
+        // attributes (packed and aligned change struct layout), so that is ignored.
+        if name.s == "__attribute__" {
+            return;
+        }
         self.macros.insert(name.s, Rc::new(Macro { objlike, params, va_name, body }));
     }
 
@@ -707,6 +717,10 @@ pub fn to_text(toks: &[Token]) -> String {
             s.push('\n');
         } else if t.space {
             s.push(' ');
+        }
+        if t.s == "__pragma_pack" {
+            s.push_str("#pragma pack");
+            continue;
         }
         s.push_str(&t.s);
     }

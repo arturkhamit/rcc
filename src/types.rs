@@ -40,6 +40,7 @@ pub struct Member {
     pub offset: i64,
     pub bit_width: i64, // < 0: not a bitfield
     pub bit_off: i64,
+    pub cast: Option<Ty>, // packed bitfields: the declared type, when `ty` is a wider access unit
 }
 
 impl Type {
@@ -220,4 +221,17 @@ pub fn f80_to_f64(m: u64, se: u16) -> f64 {
         m as f64 * 2f64.powi(e / 2) * 2f64.powi(e - e / 2)
     };
     if se >> 15 != 0 { -v } else { v }
+}
+
+/// True for structs passed and returned in memory by the System V ABI: larger
+/// than two eightbytes, or with unaligned fields (packed structs).
+pub fn mem_class(ty: &Ty) -> bool {
+    fn unaligned(ty: &Ty) -> bool {
+        match &**ty {
+            Type::Array(b, _) => unaligned(b),
+            Type::Struct(s) => s.borrow().members.iter().any(|m| m.bit_width < 0 && m.offset % m.ty.align() != 0 || unaligned(&m.ty)),
+            _ => false,
+        }
+    }
+    ty.is_struct() && (ty.size() > 16 || unaligned(ty))
 }

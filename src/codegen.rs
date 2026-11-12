@@ -21,7 +21,7 @@ pub fn has_flonum(ty: &Ty, lo: i64, hi: i64, off: i64) -> bool {
         Type::Struct(s) => s.borrow().members.iter().all(|m| has_flonum(&m.ty, lo, hi, off + m.offset)),
         Type::Array(b, n) => (0..*n).all(|i| has_flonum(b, lo, hi, off + b.size() * i)),
         Type::Float | Type::Double => true,
-        _ => off < lo || hi <= off,
+        _ => off + ty.size() <= lo || hi <= off,
     }
 }
 
@@ -31,7 +31,7 @@ fn in_regs(ty: &Ty, gp: &mut usize, fp: &mut usize) -> bool {
     let (ng, nf) = match &**ty {
         Type::LDouble => return false,
         Type::Struct(_) => {
-            if ty.size() > 16 || has_ldouble(ty) {
+            if mem_class(ty) || has_ldouble(ty) {
                 return false;
             }
             let f1 = has_flonum(ty, 0, 8, 0) as usize;
@@ -64,13 +64,15 @@ struct Gen<'a> {
     depth: i64,
     cnt: usize,
     defined: HashSet<&'a str>,
+    tls: HashSet<&'a str>,
     func: Option<&'a Obj>,
     offs: Vec<i64>,
     va: (usize, usize, i64), // gp regs used, fp regs used, start of stack args
 }
 
 pub fn codegen(globals: &[Obj]) -> String {
-    let mut g = Gen { out: String::new(), depth: 0, cnt: 0, defined: HashSet::new(), func: None, offs: vec![], va: (0, 0, 0) };
+    let mut g = Gen { out: String::new(), depth: 0, cnt: 0, defined: HashSet::new(), tls: HashSet::new(), func: None, offs: vec![], va: (0, 0, 0) };
+    g.tls = globals.iter().filter(|o| o.is_tls).map(|o| o.name.as_str()).collect();
     g.defined = globals.iter().filter(|o| o.is_def).map(|o| o.name.as_str()).collect();
 
     // Static functions are emitted only if reachable from something emitted.
@@ -147,14 +149,15 @@ impl<'a> Gen<'a> {
     fn emit_data(&mut self, o: &Obj) {
         let size = o.ty.size();
         let align = if matches!(&*o.ty, Type::Array(..)) && size >= 16 { o.ty.align().max(16) } else { o.ty.align() };
+        let align = align.max(o.align);
         if !o.name.starts_with(".L") {
             emit!(self, "  .{} {}", if o.is_static { "local" } else { "globl" }, o.name);
         }
         let Some(data) = &o.init else {
-            emit!(self, "  .bss\n  .balign {}\n{}:\n  .zero {}", align, o.name, size);
+            emit!(self, "  {}\n  .balign {}\n{}:\n  .zero {}", if o.is_tls { ".section .tbss,\"awT\",@nobits" } else { ".bss" }, align, o.name, size);
             return;
         };
-        emit!(self, "  .data\n  .balign {}\n{}:", align, o.name);
+        emit!(self, "  {}\n  .balign {}\n{}:", if o.is_tls { ".section .tdata,\"awT\",@progbits" } else { ".data" }, align, o.name);
         let (mut pos, mut ri) = (0usize, 0usize);
         while pos < data.len() {
             if ri < o.relocs.len() && o.relocs[ri].offset as usize == pos {
@@ -206,7 +209,9 @@ impl<'a> Gen<'a> {
             }
             let size = l.ty.size();
             let align = if matches!(&*l.ty, Type::Array(..)) && size >= 16 { l.ty.align().max(16) } else { l.ty.align() };
-            bottom = align_to(bottom + size, align.max(1));
+            // shortcut: the frame is 16-byte aligned, so a local cannot be aligned
+            // more strictly; realign %rsp in the prologue if that is ever needed.
+            bottom = align_to(bottom + size, align.max(l.align).clamp(1, 16));
             self.offs[i] = -bottom;
         }
 
@@ -302,6 +307,10 @@ impl<'a> Gen<'a> {
             // A VLA variable holds the address of its storage.
             NK::LVar(i) if matches!(*n.ty, Type::Vla(..)) => emit!(self, "  mov {}(%rbp), %rax", self.offs[*i]),
             NK::LVar(i) => emit!(self, "  lea {}(%rbp), %rax", self.offs[*i]),
+            NK::GVar(name) if self.tls.contains(name.as_str()) => {
+                // Initial-exec TLS model: valid in executables and in libraries loaded at startup.
+                emit!(self, "  mov {}@gottpoff(%rip), %rax\n  add %fs:0, %rax", name);
+            }
             NK::GVar(name) => {
                 if self.defined.contains(name.as_str()) {
                     emit!(self, "  lea {}(%rip), %rax", name);
@@ -379,7 +388,7 @@ impl<'a> Gen<'a> {
         match &n.kind {
             NK::LVar(_) if matches!(*n.ty, Type::Vla(..)) => None,
             NK::LVar(i) => Some(format!("{}(%rbp)", self.offs[*i])),
-            NK::GVar(name) if self.defined.contains(name.as_str()) => Some(format!("{}(%rip)", name)),
+            NK::GVar(name) if self.defined.contains(name.as_str()) && !self.tls.contains(name.as_str()) => Some(format!("{}(%rip)", name)),
             _ => None,
         }
     }
@@ -753,7 +762,7 @@ impl<'a> Gen<'a> {
 
     fn gen_call(&mut self, n: &Node, f: &Node, args: &[Node], ret_buf: Option<usize>) {
         let ret = &n.ty;
-        let ret_mem = ret.is_struct() && ret.size() > 16;
+        let ret_mem = mem_class(ret);
         let (mut gp, mut fp) = (ret_mem as usize, 0);
         let on_stack: Vec<bool> = args.iter().map(|a| !in_regs(&a.ty, &mut gp, &mut fp)).collect();
         // Offsets of the stack arguments from %rsp at the call; long doubles and
@@ -879,7 +888,7 @@ impl<'a> Gen<'a> {
                     self.gen_expr(e);
                     if e.ty.is_struct() {
                         let size = e.ty.size();
-                        if size > 16 {
+                        if mem_class(&e.ty) {
                             // Copy to the caller's buffer and return its address.
                             let off = self.offs[f.params[0]];
                             emit!(self, "  mov %rax, %rsi\n  mov {}(%rbp), %rdi\n  mov ${}, %ecx\n  rep movsb\n  mov {}(%rbp), %rax", off, size, off);

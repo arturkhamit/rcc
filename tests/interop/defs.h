@@ -1,0 +1,41 @@
+/* Shared by callee.c and caller.c: every function crosses the rcc/gcc boundary. */
+#include <stdarg.h>
+struct S1 { char c; };
+struct S3 { char c[3]; };
+struct S8 { int a; float f; };
+struct S12 { int a, b, c; };
+struct S16 { long a; double d; };
+struct SFF { float a, b; };
+struct SDD { double a, b; };
+struct SFI { float f; int i; double d; };
+struct S24 { long a, b, c; };
+struct SLD { long double v; };
+struct SMIX { char c; long double v; int i; };
+struct __attribute__((packed)) P9 { char c; long l; };
+struct __attribute__((packed)) P5 { char c; int i; };
+struct BF { unsigned a : 3; int b : 7; unsigned long c : 40; };
+union U { int i; double d; char c[9]; };
+struct NEST { struct S8 s; struct SFF f; };
+struct ARR { float f[2]; char c[5]; };
+
+struct S1 f_s1(struct S1 s, int k);
+struct S3 f_s3(struct S3 s, int k);
+struct S8 f_s8(struct S8 s, int k);
+struct S12 f_s12(int k, struct S12 s);
+struct S16 f_s16(struct S16 s, double k);
+struct SFF f_sff(float k, struct SFF s);
+struct SDD f_sdd(struct SDD s, struct SDD t);
+struct SFI f_sfi(struct SFI s, int k);
+struct S24 f_s24(struct S24 s, long k);
+struct SLD f_sld(struct SLD s, long double k);
+struct SMIX f_smix(int k, struct SMIX s);
+struct P9 f_p9(struct P9 s, int k);
+struct P5 f_p5(int k, struct P5 s);
+struct BF f_bf(struct BF s, int k);
+union U f_u(union U u, int k);
+struct NEST f_nest(struct NEST n, struct ARR a);
+struct ARR f_arr(struct ARR a, int k);
+double f_many(int a, double b, long c, float d, char e, double f, short g, double h, long i, double j, int k, double l, long m, double n, int o, double p, float q, double r, long double s, struct S16 t, struct SFF u, int v);
+long double f_va(const char *fmt, ...);
+long f_fp(long (*cb)(struct S16, int), struct S16 s);
+long cb_s16(struct S16 s, int k);

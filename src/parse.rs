@@ -61,6 +61,7 @@ pub enum NK {
 
 pub struct Local {
     pub ty: Ty,
+    pub align: i64, // from _Alignas / aligned; 0: natural
 }
 
 pub struct Reloc {
@@ -76,6 +77,8 @@ pub struct Obj {
     pub is_static: bool,
     pub is_def: bool,
     pub is_func: bool,
+    pub is_tls: bool,
+    pub align: i64, // from _Alignas / aligned; 0: natural
     pub init: Option<Vec<u8>>,
     pub relocs: Vec<Reloc>,
     pub params: Vec<usize>,
@@ -107,6 +110,8 @@ struct Attr {
     is_static: bool,
     is_extern: bool,
     is_inline: bool,
+    is_tls: bool,
+    align: i64,
 }
 
 #[derive(Default)]
@@ -205,6 +210,10 @@ fn bf(n: Node) -> Node {
         NK::Member(_, m) if (0..32).contains(&m.bit_width) && n.ty.is_integer() => {
             let loc = n.loc;
             mk(NK::Cast(bx(n)), ty_int(), loc)
+        }
+        NK::Member(_, Member { cast: Some(ty), .. }) => {
+            let (loc, ty) = (n.loc, ty.clone());
+            mk(NK::Cast(bx(n)), ty, loc)
         }
         _ => n,
     }
@@ -486,6 +495,10 @@ pub struct Parser {
     vla_saves: Vec<usize>,
     in_params: usize,
     dropped_dims: usize,
+    // Collected by skip_attrs / _Alignas since they were last reset.
+    attr_packed: bool,
+    attr_align: i64,
+    pack_points: Vec<(usize, i64)>, // #pragma pack: (token position, value from there on)
 }
 
 pub fn parse(toks: Vec<Token>) -> Vec<Obj> {
@@ -504,9 +517,36 @@ pub fn const_expr_tokens(toks: Vec<Token>) -> i64 {
     v
 }
 
-fn new_parser(toks: Vec<Token>) -> Parser {
+fn new_parser(mut toks: Vec<Token>) -> Parser {
+    // `#pragma pack` arrives as `__pragma_pack ( ... )`: strip it, remembering
+    // the packing in force from each position on.
+    let mut pack_points = vec![];
+    if toks.iter().any(|t| t.s == "__pragma_pack") {
+        let (mut out, mut stack, mut cur, mut i) = (Vec::with_capacity(toks.len()), vec![], 0i64, 0);
+        while i < toks.len() {
+            if toks[i].s != "__pragma_pack" {
+                out.push(toks[i].clone());
+                i += 1;
+                continue;
+            }
+            let end = (i..toks.len()).find(|j| toks[*j].is(")")).unwrap_or(toks.len() - 1);
+            let args = &toks[(i + 2).min(end)..end];
+            let n = args.iter().find(|t| t.kind == TK::Num).map(|t| t.ival);
+            match args.first().map(|t| t.s.as_str()) {
+                Some("push") => {
+                    stack.push(cur);
+                    cur = n.unwrap_or(cur);
+                }
+                Some("pop") => cur = stack.pop().unwrap_or(0),
+                _ => cur = n.unwrap_or(0),
+            }
+            pack_points.push((out.len(), cur));
+            i = end + 1;
+        }
+        toks = out;
+    }
     // struct __va_elem as defined by the System V x86-64 ABI
-    let mem = |name: &str, ty: Ty, offset: i64| Member { name: name.into(), ty, offset, bit_width: -1, bit_off: 0 };
+    let mem = |name: &str, ty: Ty, offset: i64| Member { name: name.into(), ty, offset, bit_width: -1, bit_off: 0, cast: None };
     let members = vec![
         mem("gp_offset", ty_uint(), 0),
         mem("fp_offset", ty_uint(), 4),
@@ -533,6 +573,9 @@ fn new_parser(toks: Vec<Token>) -> Parser {
         vla_saves: vec![],
         in_params: 0,
         dropped_dims: 0,
+        attr_packed: false,
+        attr_align: 0,
+        pack_points,
     };
     p.scopes[0].vars.insert("__builtin_va_list".into(), VS::Typedef(array_of(va_elem, 1)));
     p
@@ -582,21 +625,52 @@ impl Parser {
     }
     /// Skips `__attribute__((...))` and `__asm__("...")`.
     fn skip_attrs(&mut self) {
-        while self.is("__attribute__") || self.is_asm() {
-            self.pos += 1;
-            self.expect("(");
-            let mut depth = 1;
-            while depth > 0 {
-                if self.tok().kind == TK::Eof {
-                    self.err("unterminated attribute");
-                }
-                if self.is("(") {
-                    depth += 1;
-                } else if self.is(")") {
-                    depth -= 1;
-                }
+        loop {
+            if self.is_asm() {
                 self.pos += 1;
+                self.skip_parens();
+                continue;
             }
+            if !self.consume("__attribute__") {
+                return;
+            }
+            self.expect("(");
+            self.expect("(");
+            // `packed` and `aligned` are recorded for the caller; the rest is skipped.
+            while !self.consume(")") {
+                if self.consume(",") {
+                    continue;
+                }
+                let name = self.tok().s.trim_matches('_').to_string();
+                self.pos += 1;
+                match name.as_str() {
+                    "packed" => self.attr_packed = true,
+                    "aligned" if self.consume("(") => {
+                        self.attr_align = self.attr_align.max(self.const_expr());
+                        self.expect(")");
+                    }
+                    "aligned" => self.attr_align = self.attr_align.max(16),
+                    _ if self.is("(") => self.skip_parens(),
+                    _ if self.tok().kind == TK::Eof => self.err("unterminated attribute"),
+                    _ => {}
+                }
+            }
+            self.expect(")");
+        }
+    }
+    fn skip_parens(&mut self) {
+        self.expect("(");
+        let mut depth = 1;
+        while depth > 0 {
+            if self.tok().kind == TK::Eof {
+                self.err("unterminated parenthesis");
+            }
+            if self.is("(") {
+                depth += 1;
+            } else if self.is(")") {
+                depth -= 1;
+            }
+            self.pos += 1;
         }
     }
     /// Assembly name of a user label (`__label__` declarations shadow function-wide ones).
@@ -644,7 +718,7 @@ impl Parser {
         self.scopes.iter().rev().find_map(|s| s.tags.get(name)).cloned()
     }
     fn new_lvar(&mut self, name: &str, ty: Ty) -> usize {
-        self.locals.push(Local { ty });
+        self.locals.push(Local { ty, align: 0 });
         let i = self.locals.len() - 1;
         if !name.is_empty() {
             self.scope().vars.insert(name.to_string(), VS::Local(i));
@@ -661,6 +735,8 @@ impl Parser {
             is_static: false,
             is_def: false,
             is_func: false,
+            is_tls: false,
+            align: 0,
             init: None,
             relocs: vec![],
             params: vec![],
@@ -736,6 +812,7 @@ impl Parser {
 
         let mut ty = ty_int();
         let mut counter = 0u32;
+        (self.attr_packed, self.attr_align) = (false, 0);
         while self.is_typename() {
             let s = self.tok().s.clone();
             match s.as_str() {
@@ -745,7 +822,7 @@ impl Parser {
                         "typedef" => a.is_typedef = true,
                         "static" => a.is_static = true,
                         "extern" => a.is_extern = true,
-                        "_Thread_local" | "__thread" => self.err("thread-local storage is not supported"),
+                        "_Thread_local" | "__thread" => a.is_tls = true,
                         _ => a.is_inline = true,
                     }
                     self.pos += 1;
@@ -761,14 +838,11 @@ impl Parser {
                     continue;
                 }
                 "_Alignas" => {
-                    // shortcut: _Alignas is parsed and ignored; honor it if over-aligned data is needed.
                     self.pos += 1;
                     self.expect("(");
-                    if self.is_typename() {
-                        self.typename();
-                    } else {
-                        self.const_expr();
-                    }
+                    let save = (self.attr_packed, self.attr_align);
+                    let n = if self.is_typename() { self.typename().align() } else { self.const_expr() };
+                    (self.attr_packed, self.attr_align) = (save.0, save.1.max(n));
                     self.expect(")");
                     continue;
                 }
@@ -836,6 +910,9 @@ impl Parser {
             } else {
                 self.err("invalid type")
             };
+        }
+        if let Some(a) = attr {
+            a.align = self.attr_align;
         }
         ty
     }
@@ -984,7 +1061,18 @@ impl Parser {
     }
 
     fn struct_decl(&mut self, is_union: bool) -> Ty {
+        // The attributes of the struct itself are kept apart from those of the
+        // declaration it appears in.
+        let outer = (self.attr_packed, self.attr_align);
+        (self.attr_packed, self.attr_align) = (false, 0);
+        let ty = self.struct_decl2(is_union);
+        (self.attr_packed, self.attr_align) = outer;
+        ty
+    }
+
+    fn struct_decl2(&mut self, is_union: bool) -> Ty {
         self.skip_attrs();
+        let (mut packed, mut salign) = (self.attr_packed, self.attr_align);
         let mut tag = None;
         if self.tok().kind == TK::Ident {
             tag = Some(self.ident());
@@ -998,6 +1086,7 @@ impl Parser {
             self.scope().tags.insert(tag, t.clone());
             return t;
         }
+        let pack = self.pack_points.iter().rev().find(|(p, _)| *p <= self.pos).map_or(0, |p| p.1);
         self.pos += 1;
         // Complete a forward-declared struct in the same scope, or make a new one.
         let existing = tag.as_ref().and_then(|t| self.scope().tags.get(t).cloned());
@@ -1013,6 +1102,7 @@ impl Parser {
         };
 
         let mut members: Vec<Member> = Vec::new();
+        let mut extra: Vec<(i64, bool)> = Vec::new(); // per member: explicit alignment, packed
         while !self.consume("}") {
             if self.is("_Static_assert") {
                 self.static_assert();
@@ -1020,8 +1110,10 @@ impl Parser {
             }
             let mut attr = Attr::default();
             let base = self.declspec(Some(&mut attr));
+            let base_packed = self.attr_packed;
             if base.is_struct() && self.consume(";") {
-                members.push(Member { name: String::new(), ty: base, offset: 0, bit_width: -1, bit_off: 0 });
+                members.push(Member { name: String::new(), ty: base, offset: 0, bit_width: -1, bit_off: 0, cast: None });
+                extra.push((attr.align, base_packed));
                 continue;
             }
             let mut first = true;
@@ -1030,8 +1122,9 @@ impl Parser {
                     self.expect(",");
                 }
                 first = false;
+                (self.attr_packed, self.attr_align) = (false, 0);
                 let (mty, name) = if self.is(":") { (base.clone(), None) } else { self.declarator(base.clone()) };
-                let mut m = Member { name: name.unwrap_or_default(), ty: mty, offset: 0, bit_width: -1, bit_off: 0 };
+                let mut m = Member { name: name.unwrap_or_default(), ty: mty, offset: 0, bit_width: -1, bit_off: 0, cast: None };
                 if let Type::Vla(..) = &*m.ty {
                     self.err("variable-length array in a struct is not supported");
                 }
@@ -1040,24 +1133,50 @@ impl Parser {
                 }
                 self.skip_attrs();
                 members.push(m);
+                extra.push((attr.align.max(self.attr_align), base_packed || self.attr_packed));
             }
         }
+        (self.attr_packed, self.attr_align) = (false, 0);
         self.skip_attrs();
+        packed |= self.attr_packed;
+        salign = salign.max(self.attr_align);
 
         // Layout (bitfields follow the GCC/System V rules).
         let (mut bits, mut align, mut size) = (0i64, 1i64, 0i64);
-        for m in members.iter_mut() {
-            let (msz, mal) = (m.ty.size(), m.ty.align());
+        for (m, (explicit, mpacked)) in members.iter_mut().zip(&extra) {
+            let (msz, natural) = (m.ty.size(), m.ty.align());
+            let mut mal = if packed || *mpacked { 1 } else { natural };
+            if pack > 0 {
+                mal = mal.min(pack);
+            }
+            let tight = mal < natural; // packed: bitfields are not aligned to their unit
+            mal = mal.max(*explicit);
             if is_union {
                 size = size.max(msz);
                 align = align.max(mal);
                 continue;
             }
             if m.bit_width == 0 {
-                bits = align_to(bits, msz * 8);
+                bits = align_to(bits, if tight { 8 } else { msz * 8 });
                 continue;
             }
-            if m.bit_width > 0 {
+            if m.bit_width > 0 && tight {
+                m.offset = bits / 8;
+                m.bit_off = bits % 8;
+                // Access the smallest unit covering the field.
+                // shortcut: that unit can still reach up to 7 bytes past the end of the
+                // struct, and a field spanning 9 bytes is rejected; both need byte-wise access.
+                let Some(unit) = [1u8, 2, 4, 8].into_iter().find(|s| m.bit_off + m.bit_width <= *s as i64 * 8) else {
+                    self.err("this packed bit-field layout is not supported")
+                };
+                if unit as i64 != msz {
+                    if m.bit_width >= 32 {
+                        m.cast = Some(m.ty.clone());
+                    }
+                    m.ty = ty_ints(unit, m.ty.is_unsigned());
+                }
+                bits += m.bit_width;
+            } else if m.bit_width > 0 {
                 if bits / (msz * 8) != (bits + m.bit_width - 1) / (msz * 8) {
                     bits = align_to(bits, msz * 8);
                 }
@@ -1074,6 +1193,7 @@ impl Parser {
         if !is_union {
             size = align_to(bits, 8) / 8;
         }
+        align = align.max(salign);
         // Unnamed bitfields only affect layout.
         members.retain(|m| !(m.name.is_empty() && m.bit_width >= 0));
         let Type::Struct(sd) = &*ty else { unreachable!() };
@@ -1123,8 +1243,15 @@ impl Parser {
                 self.expect(",");
             }
             first = false;
+            self.attr_align = 0;
             let (ty, name) = self.declarator(base.clone());
             self.skip_attrs();
+            if let (true, Type::Struct(sd)) = (self.attr_align > 0, &*ty) {
+                // `typedef struct {..} T __attribute__((aligned(n)))`
+                // shortcut: this raises the alignment of the struct type itself.
+                let mut sd = sd.borrow_mut();
+                sd.align = sd.align.max(self.attr_align); // like GCC, the size stays
+            }
             let Some(name) = name else { self.err("typedef name omitted") };
             self.scope().vars.insert(name, VS::Typedef(ty));
         }
@@ -1164,8 +1291,10 @@ impl Parser {
                     self.expect(",");
                 }
                 first = false;
+                self.attr_align = 0;
                 let (ty, name) = self.declarator(base.clone());
                 self.skip_attrs();
+                let align = attr.align.max(self.attr_align);
                 let Some(name) = name else { self.err("variable name omitted") };
                 if let Type::Func(fty) = &*ty {
                     let mut ty = ty.clone();
@@ -1201,6 +1330,8 @@ impl Parser {
                 let i = self.get_or_new_global(&name, ty);
                 self.scopes[0].vars.insert(name, VS::Global(i));
                 self.globals[i].is_static |= attr.is_static;
+                self.globals[i].is_tls |= attr.is_tls;
+                self.globals[i].align = self.globals[i].align.max(align);
                 if !attr.is_extern {
                     self.globals[i].is_def = true;
                 }
@@ -1236,7 +1367,7 @@ impl Parser {
         self.ret_ty = fty.ret.clone();
         self.scopes.push(Scope::default());
         let mut params = vec![];
-        if fty.ret.is_struct() && fty.ret.size() > 16 {
+        if mem_class(&fty.ret) {
             // Hidden pointer to the caller's return buffer.
             params.push(self.new_lvar("", ptr_to(fty.ret.clone())));
         }
@@ -1658,8 +1789,10 @@ impl Parser {
                 self.expect(",");
             }
             first = false;
+            self.attr_align = 0;
             let (ty, name) = self.declarator(base.clone());
             self.skip_attrs();
+            let align = attr.align.max(self.attr_align);
             let Some(name) = name else { self.err("variable name omitted") };
             for e in std::mem::take(&mut self.vla_pending) {
                 out.push(mk(NK::ExprStmt(bx(e)), ty_void(), loc));
@@ -1671,11 +1804,14 @@ impl Parser {
             }
             if attr.is_extern {
                 let i = self.get_or_new_global(&name, ty);
+                self.globals[i].is_tls |= attr.is_tls;
                 self.scope().vars.insert(name, VS::Global(i));
                 continue;
             }
             if attr.is_static {
                 let i = self.new_anon_global(&name, ty);
+                self.globals[i].is_tls = attr.is_tls;
+                self.globals[i].align = align;
                 self.scope().vars.insert(name, VS::Global(i));
                 if self.consume("=") {
                     self.gvar_initializer(i);
@@ -1686,6 +1822,7 @@ impl Parser {
                 self.err("variable declared void");
             }
             let l = self.new_lvar(&name, ty.clone());
+            self.locals[l].align = align;
             if let Type::Vla(_, sv) = &*ty {
                 let save = self.new_lvar("", ty_ulong());
                 self.vla_saves.push(save);
@@ -2286,7 +2423,7 @@ impl Parser {
             let fix = new_assign(field(self, 2), mk(NK::Cast(bx(up)), ptr_to(ty_char()), loc), loc);
             mem = new_comma(fix, mem, loc);
         }
-        let in_mem = ty.size() > 16 || has_ldouble(&ty);
+        let in_mem = mem_class(&ty) || has_ldouble(&ty);
         let from_reg = |p: &Parser, i: usize, step: i64| new_sub(new_add(field(p, 3), new_cast(field(p, i), ty_long()), loc), num(step, loc), loc);
         let fits = |p: &Parser, i: usize, n: i64| {
             let (step, limit) = if i == 0 { (8, 48) } else { (16, 176) };
