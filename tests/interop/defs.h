@@ -39,3 +39,4 @@ double f_many(int a, double b, long c, float d, char e, double f, short g, doubl
 long double f_va(const char *fmt, ...);
 long f_fp(long (*cb)(struct S16, int), struct S16 s);
 long cb_s16(struct S16 s, int k);
+double f_knr(); /* K&R: (float, char, short, double) */

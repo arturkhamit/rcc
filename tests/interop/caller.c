@@ -24,5 +24,6 @@ int main(void) {
   printf("%Lg\n", f_va("ildLsfbpLidddddddddiiiiiiisL", 1, 2L, 3.5, 4.25L, (struct S16){ 5, 6.5 }, (struct SFF){ 7.5f, 8.5f }, (struct S24){ 9, 10, 11 }, (struct P9){ 12, 13 }, 0.125L, 14,
                   1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 1, 2, 3, 4, 5, 6, 7, (struct S16){ 100, 0.5 }, 1e3L));
   printf("%ld\n", f_fp(cb_s16, (struct S16){ 3, 4.75 }));
+  printf("%g\n", f_knr(1.25f, 'a', (short)-7, 0.5));
   return 0;
 }

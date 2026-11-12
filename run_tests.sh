@@ -21,7 +21,7 @@ export -f run_one; export RCC tmp
 ls tests/c-testsuite/tests/single-exec/*.c tests/local/*.c 2>/dev/null | xargs -P 8 -I{} bash -c 'run_one {}' | sort > "$tmp/res"
 # ABI: objects compiled by rcc and by gcc must call each other (tests/interop).
 I=tests/interop
-if gcc -w -c $I/callee.c -o $tmp/callee.g.o && gcc -w -c $I/caller.c -o $tmp/caller.g.o && gcc $tmp/callee.g.o $tmp/caller.g.o -o $tmp/interop && $tmp/interop > $tmp/interop.exp; then
+if gcc -std=gnu17 -w -c $I/callee.c -o $tmp/callee.g.o && gcc -std=gnu17 -w -c $I/caller.c -o $tmp/caller.g.o && gcc $tmp/callee.g.o $tmp/caller.g.o -o $tmp/interop && $tmp/interop > $tmp/interop.exp; then
   "$RCC" -c $I/callee.c -o $tmp/callee.r.o 2>$tmp/interop.err; "$RCC" -c $I/caller.c -o $tmp/caller.r.o 2>>$tmp/interop.err
   for pair in "callee.r caller.g" "callee.g caller.r" "callee.r caller.r"; do
     set -- $pair

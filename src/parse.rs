@@ -542,6 +542,7 @@ pub struct Parser {
     in_params: usize,
     dropped_dims: bool,
     fn_params: (usize, bool), // last parameter list: token position, had variable dimensions
+    knr_declared: Option<Vec<Ty>>, // declared parameter types of the K&R definition being parsed
     // Collected by skip_attrs / _Alignas since they were last reset.
     attr_packed: bool,
     attr_align: i64,
@@ -624,6 +625,7 @@ fn new_parser(mut toks: Vec<Token>) -> Parser {
         in_params: 0,
         dropped_dims: false,
         fn_params: (0, false),
+        knr_declared: None,
         attr_packed: false,
         attr_align: 0,
         attr_mode: 0,
@@ -1446,8 +1448,9 @@ impl Parser {
                     let mut ty = ty.clone();
                     if self.is_typename() {
                         // K&R definition: parameter declarations follow the declarator.
-                        // shortcut: it then behaves like a prototype (no default promotions
-                        // on the callee side), fine as long as callers are compiled by rcc.
+                        // Arguments arrive with the default promotions applied, so the
+                        // function type gets the promoted types and the function converts
+                        // them to the declared ones on entry.
                         let mut params = fty.params.clone();
                         while !self.is("{") {
                             let base = self.declspec(None);
@@ -1463,7 +1466,9 @@ impl Parser {
                             }
                             self.expect(";");
                         }
-                        ty = Rc::new(Type::Func(Rc::new(FuncTy { ret: fty.ret.clone(), params, names: fty.names.clone(), variadic: false, oldstyle: false })));
+                        let promoted = params.iter().map(|t| if let Type::Float = **t { ty_double() } else { promote(t) }).collect();
+                        self.knr_declared = Some(params);
+                        ty = Rc::new(Type::Func(Rc::new(FuncTy { ret: fty.ret.clone(), params: promoted, names: fty.names.clone(), variadic: false, oldstyle: false })));
                     }
                     let i = self.declare_func(&name, ty.clone(), &attr);
                     self.globals[i].align = self.globals[i].align.max(align);
@@ -1519,14 +1524,25 @@ impl Parser {
             // Hidden pointer to the caller's return buffer.
             params.push(self.new_lvar("", ptr_to(fty.ret.clone())));
         }
-        for (pty, pname) in fty.params.iter().zip(&fty.names) {
-            params.push(self.new_lvar(pname, pty.clone()));
+        let mut entry = vec![];
+        let knr = self.knr_declared.take();
+        for (k, (pty, pname)) in fty.params.iter().zip(&fty.names).enumerate() {
+            match knr.as_ref().and_then(|d| d.get(k)) {
+                Some(declared) if !same_type(declared, pty) => {
+                    // K&R: the promoted argument is converted to the declared type.
+                    let (arg, loc) = (self.new_lvar("", pty.clone()), self.loc());
+                    params.push(arg);
+                    let l = self.new_lvar(pname, declared.clone());
+                    let set = new_assign(self.lvar(l, loc), self.lvar(arg, loc), loc);
+                    entry.push(mk(NK::ExprStmt(bx(set)), ty_void(), loc));
+                }
+                _ => params.push(self.new_lvar(pname, pty.clone())),
+            }
         }
         let va_area = if fty.variadic { Some(self.new_lvar("", array_of(ty_char(), 176))) } else { None };
         // Variably modified parameter types (`int a[n][m]`): parse the parameter
         // declarations again, now that the parameters are in scope. The size
         // expressions are evaluated on entry to the function.
-        let mut entry = vec![];
         if let (start, true) = self.fn_params {
             let (save, loc) = (self.pos, self.loc());
             self.pos = start;

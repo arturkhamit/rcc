@@ -36,3 +36,4 @@ long double f_va(const char *fmt, ...) {
   va_end(ap); return r;
 }
 long f_fp(long (*cb)(struct S16, int), struct S16 s) { return cb(s, 5) + cb_s16(s, 1); }
+double f_knr(f, c, s, d) float f; char c; short s; double d; { return f * 2 + c + s + d + sizeof f + sizeof c; }
