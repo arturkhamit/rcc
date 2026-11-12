@@ -1559,9 +1559,10 @@ impl Parser {
             self.pos = save;
             entry.extend(std::mem::take(&mut self.vla_pending).into_iter().map(|e| mk(NK::ExprStmt(bx(e)), ty_void(), loc)));
         }
+        let loc = self.loc();
         self.expect("{");
         entry.push(self.block());
-        let body = mk(NK::Block(entry), ty_void(), self.loc());
+        let body = mk(NK::Block(entry), ty_void(), loc);
         self.scopes.pop();
 
         let g = &mut self.globals[i];

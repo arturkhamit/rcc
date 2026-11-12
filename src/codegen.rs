@@ -72,12 +72,15 @@ struct Gen<'a> {
     offs: Vec<i64>,
     va: (usize, usize, i64), // gp regs used, fp regs used, start of stack args
     has_asm: bool,           // the current function contains an asm statement
+    debug: bool,
+    last_loc: (u32, u32), // source position of the last .loc directive
 }
 
 /// `pic`: the code may go into a shared library, where a global symbol can be
 /// preempted and so must be reached through the GOT even if defined here.
-pub fn codegen(globals: &[Obj], top_asm: &[String], pic: bool) -> String {
-    let mut g = Gen { out: String::new(), depth: 0, cnt: 0, defined: HashSet::new(), tls: HashSet::new(), func: None, offs: vec![], va: (0, 0, 0), has_asm: false };
+/// `debug`: emit line number information (`-g`).
+pub fn codegen(globals: &[Obj], top_asm: &[String], pic: bool, debug: bool) -> String {
+    let mut g = Gen { out: String::new(), depth: 0, cnt: 0, defined: HashSet::new(), tls: HashSet::new(), func: None, offs: vec![], va: (0, 0, 0), has_asm: false, debug, last_loc: (0, 0) };
     g.tls = globals.iter().filter(|o| o.is_tls).map(|o| o.name.as_str()).collect();
     g.defined = globals.iter().filter(|o| o.is_def && (o.is_static || !pic)).map(|o| o.name.as_str()).collect();
 
@@ -111,6 +114,11 @@ pub fn codegen(globals: &[Obj], top_asm: &[String], pic: bool) -> String {
         }
     }
 
+    if debug {
+        for i in 0..crate::lex::file_count() {
+            emit!(g, "  .file {} {:?}", i + 1, crate::lex::file_name(i));
+        }
+    }
     for text in top_asm {
         emit!(g, "{}", text);
     }
@@ -279,7 +287,14 @@ impl<'a> Gen<'a> {
             emit!(self, "  .balign {}", f.align);
         }
         emit!(self, "  .type {}, @function\n{}:", f.name, f.name);
-        emit!(self, "  push %rbp\n  mov %rsp, %rbp\n  sub ${}, %rsp", align_to(bottom, 16));
+        if self.debug {
+            let loc = f.body.as_ref().unwrap().loc;
+            emit!(self, "  .loc {} {}", loc.0 + 1, loc.1);
+        }
+        // The .cfi directives describe the frame for unwinders and debuggers.
+        emit!(self, "  .cfi_startproc\n  push %rbp\n  .cfi_def_cfa_offset 16\n  .cfi_offset %rbp, -16\n  mov %rsp, %rbp\n  .cfi_def_cfa_register %rbp");
+        emit!(self, "  sub ${}, %rsp", align_to(bottom, 16));
+        self.last_loc = (0, 0);
 
         for &v in &f.vla_saves {
             emit!(self, "  movq $0, {}(%rbp)", self.offs[v]);
@@ -335,7 +350,7 @@ impl<'a> Gen<'a> {
         if f.name == "main" && !matches!(*fty.ret, Type::Void) {
             emit!(self, "  mov $0, %eax");
         }
-        emit!(self, ".L.return.{}:\n  mov %rbp, %rsp\n  pop %rbp\n  ret", f.name);
+        emit!(self, ".L.return.{}:\n  mov %rbp, %rsp\n  pop %rbp\n  .cfi_def_cfa %rsp, 8\n  ret\n  .cfi_endproc", f.name);
         emit!(self, "  .size {}, .-{}", f.name, f.name);
         if !self.has_asm {
             let text = crate::opt::remove_dead_code(&self.out[start..]);
@@ -1166,6 +1181,10 @@ impl<'a> Gen<'a> {
     // ----- statements -----
 
     fn gen_stmt(&mut self, n: &Node) {
+        if self.debug && n.loc != self.last_loc && !matches!(n.kind, NK::Block(_) | NK::Nop) {
+            emit!(self, "  .loc {} {}", n.loc.0 + 1, n.loc.1);
+            self.last_loc = n.loc;
+        }
         match &n.kind {
             NK::Nop => {}
             NK::Return(e) => {

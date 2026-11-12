@@ -27,6 +27,7 @@ struct Opts {
     defines: Vec<(bool, String)>, // (is -D, argument)
     includes: Vec<String>,        // -include
     pic: bool,                    // -fPIC or -shared
+    debug: bool,                  // -g
 }
 
 /// Returns the tokens of the builtin prelude and of the translation unit.
@@ -52,7 +53,7 @@ fn compile(path: &str, opts: &Opts) -> String {
     toks.extend(unit);
     let toks = lex::convert(toks);
     let (globals, top_asm) = parse::parse(toks);
-    codegen::codegen(&globals, &top_asm, opts.pic)
+    codegen::codegen(&globals, &top_asm, opts.pic, opts.debug)
 }
 
 fn with_ext(path: &str, ext: &str) -> String {
@@ -148,6 +149,8 @@ fn main() {
                 link.push(path);
             }
             "-fPIC" | "-fpic" => opts.pic = true,
+            "-g0" => opts.debug = false,
+            _ if a.starts_with("-g") => opts.debug = true,
             "-shared" => {
                 opts.pic = true;
                 link.push(a.to_string());
