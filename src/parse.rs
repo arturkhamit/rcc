@@ -341,6 +341,8 @@ fn eval2(n: &Node, mut label: Option<&mut String>) -> i64 {
         }
         NK::Cast(l) => eval2(l, label),
         NK::Addr(l) => eval_rval(l, label),
+        // An array-typed lvalue evaluates to its address.
+        NK::Deref(l) if matches!(&*n.ty, Type::Array(..)) => eval2(l, label),
         NK::Member(l, m) => {
             if label.is_none() || !matches!(&*n.ty, Type::Array(..)) {
                 err(n.loc, "not a compile-time constant");
@@ -1975,31 +1977,41 @@ impl Parser {
         let size8 = align_to(ty.size().max(1), 8);
         // Memory class: taken from the overflow area.
         let mem = new_comma(bump(self, 2, size8), new_sub(field(self, 2), num(size8, loc), loc), loc);
-        // Register class: (field index, bytes per register, size of the save area)
-        let reg = if let Type::Struct(_) = &*ty {
-            if ty.size() > 16 {
-                None
-            } else if !crate::codegen::has_flonum(&ty, 0, 8, 0) && (ty.size() <= 8 || !crate::codegen::has_flonum(&ty, 8, 16, 0)) {
-                Some((0, size8, 48))
-            } else if ty.size() <= 8 {
-                Some((1, 16, 176))
-            } else {
-                err(loc, "va_arg of a struct passed in SSE registers is not supported")
-            }
-        } else if ty.is_flonum() {
-            Some((1, 16, 176))
-        } else {
-            Some((0, 8, 48))
+        let from_reg = |p: &Parser, i: usize, step: i64| new_sub(new_add(field(p, 3), new_cast(field(p, i), ty_long()), loc), num(step, loc), loc);
+        let fits = |p: &Parser, i: usize, n: i64| {
+            let (step, limit) = if i == 0 { (8, 48) } else { (16, 176) };
+            new_binary(Op::Le, field(p, i), num(limit - step * n, loc), loc)
         };
-        let addr = match reg {
-            None => mem,
-            Some((i, step, limit)) => {
-                let fits = new_binary(Op::Le, field(self, i), num(limit - step, loc), loc);
-                let off = new_cast(field(self, i), ty_long());
-                let from_reg = new_comma(bump(self, i, step), new_sub(new_add(field(self, 3), off, loc), num(step, loc), loc), loc);
-                let pty = from_reg.ty.clone();
-                mk(NK::Cond(bx(fits), bx(from_reg), bx(mem)), pty, loc)
+        let addr = if let Type::Struct(_) = &*ty {
+            if ty.size() > 16 {
+                mem
+            } else {
+                // Small struct: each eightbyte comes from the GP or the SSE save
+                // area; assemble them in a temporary.
+                let classes: Vec<usize> = [0, 8].iter().filter(|lo| **lo < ty.size()).map(|lo| crate::codegen::has_flonum(&ty, *lo, lo + 8, 0) as usize).collect();
+                let buf = self.new_lvar("", array_of(ty_long(), 2));
+                let mut copy: Option<Node> = None;
+                for (k, &c) in classes.iter().enumerate() {
+                    let step = if c == 0 { 8 } else { 16 };
+                    let src = new_deref(mk(NK::Cast(bx(from_reg(self, c, step))), ptr_to(ty_long()), loc), loc);
+                    let dst = new_deref(new_add(self.lvar(buf, loc), num(k as i64, loc), loc), loc);
+                    let e = new_comma(bump(self, c, step), new_assign(dst, src, loc), loc);
+                    copy = Some(match copy {
+                        Some(prev) => new_comma(prev, e, loc),
+                        None => e,
+                    });
+                }
+                let (ngp, nfp) = (classes.iter().filter(|c| **c == 0).count() as i64, classes.iter().filter(|c| **c == 1).count() as i64);
+                let cond = mk(NK::LogAnd(bx(fits(self, 0, ngp)), bx(fits(self, 1, nfp))), ty_int(), loc);
+                let then = new_comma(copy.unwrap(), mk(NK::Cast(bx(self.lvar(buf, loc))), mem.ty.clone(), loc), loc);
+                let pty = mem.ty.clone();
+                mk(NK::Cond(bx(cond), bx(then), bx(mem)), pty, loc)
             }
+        } else {
+            let (i, step) = if ty.is_flonum() { (1, 16) } else { (0, 8) };
+            let then = new_comma(bump(self, i, step), from_reg(self, i, step), loc);
+            let pty = mem.ty.clone();
+            mk(NK::Cond(bx(fits(self, i, 1)), bx(then), bx(mem)), pty, loc)
         };
         let val = new_deref(mk(NK::Cast(bx(addr)), ptr_to(ty), loc), loc);
         new_comma(set, val, loc)

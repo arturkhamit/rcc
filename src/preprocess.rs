@@ -85,6 +85,7 @@ pub struct Preprocessor {
     conds: Vec<Cond>,
     include_paths: Vec<String>,
     once: HashSet<String>,
+    pushed: HashMap<String, Vec<Option<Rc<Macro>>>>,
     counter: i64,
     depth: usize,
 }
@@ -122,7 +123,7 @@ impl Preprocessor {
         for d in ["/usr/local/include", "/usr/include/x86_64-linux-gnu", "/usr/include"] {
             include_paths.push(d.to_string());
         }
-        let mut pp = Preprocessor { macros: HashMap::new(), conds: vec![], include_paths, once: HashSet::new(), counter: 0, depth: 0 };
+        let mut pp = Preprocessor { macros: HashMap::new(), conds: vec![], include_paths, once: HashSet::new(), pushed: HashMap::new(), counter: 0, depth: 0 };
         let mut inp = tokenize(PREDEFINED.as_bytes(), add_file("<built-in>"));
         inp.reverse();
         pp.process(&mut inp, &mut vec![]);
@@ -236,12 +237,36 @@ impl Preprocessor {
                 }
                 "pragma" => {
                     let line = read_line(inp);
-                    if line.first().is_some_and(|t| t.s == "once") {
-                        self.once.insert(file_name(d.file));
+                    let arg = |i: usize| line.get(i).map(|t| t.s.as_str()).unwrap_or("");
+                    let name = arg(2).trim_matches('"').to_string();
+                    match arg(0) {
+                        "once" => {
+                            self.once.insert(file_name(d.file));
+                        }
+                        "push_macro" => self.pushed.entry(name.clone()).or_default().push(self.macros.get(&name).cloned()),
+                        "pop_macro" => match self.pushed.get_mut(&name).and_then(|v| v.pop()) {
+                            Some(Some(m)) => {
+                                self.macros.insert(name, m);
+                            }
+                            Some(None) => {
+                                self.macros.remove(&name);
+                            }
+                            None => {}
+                        },
+                        _ => {}
+                    }
+                }
+                "line" => {
+                    // Renumber the rest of this file. The file name operand is ignored.
+                    let line = self.expand_all(read_line(inp));
+                    let Some(n) = line.first().and_then(|t| t.s.parse::<u32>().ok()) else { err(&d, "invalid #line directive") };
+                    let delta = n.wrapping_sub(d.line + 1);
+                    for t in inp.iter_mut().rev().take_while(|t| t.file == d.file) {
+                        t.line = t.line.wrapping_add(delta);
                     }
                 }
                 "__include_end" => self.depth -= 1,
-                "line" | "ident" | "warning" => {
+                "ident" | "warning" => {
                     read_line(inp);
                 }
                 "error" => {

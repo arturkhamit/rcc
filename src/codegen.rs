@@ -298,31 +298,59 @@ impl<'a> Gen<'a> {
     }
 
     fn load(&mut self, ty: &Ty) {
+        self.load_from(ty, "(%rax)");
+    }
+
+    /// Loads a value of the given type from a memory operand.
+    fn load_from(&mut self, ty: &Ty, src: &str) {
         match &**ty {
-            Type::Array(..) | Type::Struct(_) | Type::Func(_) | Type::Void => {}
-            Type::Float => emit!(self, "  movss (%rax), %xmm0"),
-            Type::Double => emit!(self, "  movsd (%rax), %xmm0"),
-            Type::Bool => emit!(self, "  movzbl (%rax), %eax"),
-            Type::Int { size: 1, unsigned } => emit!(self, "  mov{}bl (%rax), %eax", if *unsigned { 'z' } else { 's' }),
-            Type::Int { size: 2, unsigned } => emit!(self, "  mov{}wl (%rax), %eax", if *unsigned { 'z' } else { 's' }),
-            Type::Int { size: 4, .. } => emit!(self, "  mov (%rax), %eax"),
-            _ => emit!(self, "  mov (%rax), %rax"),
+            // Arrays, structs and functions are represented by their address.
+            Type::Array(..) | Type::Struct(_) | Type::Func(_) | Type::Void => {
+                if src != "(%rax)" {
+                    emit!(self, "  lea {}, %rax", src);
+                }
+            }
+            Type::Float => emit!(self, "  movss {}, %xmm0", src),
+            Type::Double => emit!(self, "  movsd {}, %xmm0", src),
+            Type::Bool => emit!(self, "  movzbl {}, %eax", src),
+            Type::Int { size: 1, unsigned } => emit!(self, "  mov{}bl {}, %eax", if *unsigned { 'z' } else { 's' }, src),
+            Type::Int { size: 2, unsigned } => emit!(self, "  mov{}wl {}, %eax", if *unsigned { 'z' } else { 's' }, src),
+            Type::Int { size: 4, .. } => emit!(self, "  mov {}, %eax", src),
+            _ => emit!(self, "  mov {}, %rax", src),
         }
     }
 
     /// Stores %rax (or %xmm0) to the address on the stack top.
     fn store(&mut self, ty: &Ty) {
         self.pop("%rdi");
+        self.store_to(ty, "(%rdi)");
+    }
+
+    fn store_to(&mut self, ty: &Ty, dst: &str) {
         match &**ty {
-            Type::Struct(_) => emit!(self, "  mov %rax, %rsi\n  mov ${}, %ecx\n  rep movsb", ty.size()),
-            Type::Float => emit!(self, "  movss %xmm0, (%rdi)"),
-            Type::Double => emit!(self, "  movsd %xmm0, (%rdi)"),
+            Type::Struct(_) => {
+                if dst != "(%rdi)" {
+                    emit!(self, "  lea {}, %rdi", dst);
+                }
+                emit!(self, "  mov %rax, %rsi\n  mov ${}, %ecx\n  rep movsb", ty.size());
+            }
+            Type::Float => emit!(self, "  movss %xmm0, {}", dst),
+            Type::Double => emit!(self, "  movsd %xmm0, {}", dst),
             _ => match ty.size() {
-                1 => emit!(self, "  mov %al, (%rdi)"),
-                2 => emit!(self, "  mov %ax, (%rdi)"),
-                4 => emit!(self, "  mov %eax, (%rdi)"),
-                _ => emit!(self, "  mov %rax, (%rdi)"),
+                1 => emit!(self, "  mov %al, {}", dst),
+                2 => emit!(self, "  mov %ax, {}", dst),
+                4 => emit!(self, "  mov %eax, {}", dst),
+                _ => emit!(self, "  mov %rax, {}", dst),
             },
+        }
+    }
+
+    /// Memory operand of a variable that can be addressed directly.
+    fn direct(&self, n: &Node) -> Option<String> {
+        match &n.kind {
+            NK::LVar(i) => Some(format!("{}(%rbp)", self.offs[*i])),
+            NK::GVar(name) if self.defined.contains(name.as_str()) => Some(format!("{}(%rip)", name)),
+            _ => None,
         }
     }
 
@@ -421,10 +449,13 @@ impl<'a> Gen<'a> {
                     _ => emit!(self, "  neg %rax"),
                 }
             }
-            NK::LVar(_) | NK::GVar(_) => {
-                self.gen_addr(n);
-                self.load(&n.ty);
-            }
+            NK::LVar(_) | NK::GVar(_) => match self.direct(n) {
+                Some(m) => self.load_from(&n.ty, &m),
+                None => {
+                    self.gen_addr(n);
+                    self.load(&n.ty);
+                }
+            },
             NK::Member(_, m) => {
                 self.gen_addr(n);
                 self.load(&n.ty);
@@ -439,6 +470,12 @@ impl<'a> Gen<'a> {
             }
             NK::Addr(l) => self.gen_addr(l),
             NK::Assign(l, r) => {
+                if let Some(m) = self.direct(l) {
+                    // Evaluating the value first also keeps `x = setjmp(..)` working.
+                    self.gen_expr(r);
+                    self.store_to(&n.ty, &m);
+                    return;
+                }
                 self.gen_addr(l);
                 self.push();
                 self.gen_expr(r);
@@ -603,7 +640,7 @@ impl<'a> Gen<'a> {
         let ret_mem = ret.is_struct() && ret.size() > 16;
         let (mut gp, mut fp) = (ret_mem as usize, 0);
         let on_stack: Vec<bool> = args.iter().map(|a| !in_regs(&a.ty, &mut gp, &mut fp)).collect();
-        let mut slots: i64 = args.iter().zip(&on_stack).filter(|(_, s)| **s).map(|(a, _)| align_to(a.ty.size(), 8) / 8).sum();
+        let mut slots: i64 = args.iter().zip(&on_stack).filter(|(_, s)| **s).map(|(a, _)| if a.ty.is_struct() { align_to(a.ty.size(), 8) / 8 } else { 1 }).sum();
         if (self.depth + slots) % 2 == 1 {
             emit!(self, "  sub $8, %rsp");
             self.depth += 1;
