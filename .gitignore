@@ -4,3 +4,4 @@ tests/c-testsuite/
 *.s
 a.out
 /tmp/
+tests/ext/
