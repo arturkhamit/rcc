@@ -10,6 +10,7 @@ const BUILTIN_HEADERS: &[(&str, &str)] = &[
     ("stdarg.h", include_str!("../include/stdarg.h")),
     ("stdbool.h", include_str!("../include/stdbool.h")),
     ("stdalign.h", include_str!("../include/stdalign.h")),
+    ("stdatomic.h", include_str!("../include/stdatomic.h")),
     ("stdnoreturn.h", include_str!("../include/stdnoreturn.h")),
     ("iso646.h", include_str!("../include/iso646.h")),
     ("float.h", include_str!("../include/float.h")),
