@@ -92,3 +92,21 @@ static int __rcc_ovf(int op, unsigned long a, int na, unsigned long b, int nb, i
 #define __builtin_umul_overflow(a, b, r) __builtin_mul_overflow((unsigned)(a), (unsigned)(b), (unsigned *)(r))
 #define __builtin_umull_overflow(a, b, r) __builtin_mul_overflow((unsigned long)(a), (unsigned long)(b), (unsigned long *)(r))
 #define __builtin_umulll_overflow(a, b, r) __builtin_mul_overflow((unsigned long long)(a), (unsigned long long)(b), (unsigned long long *)(r))
+
+/* Atomic operations on integers and pointers of 1 to 8 bytes; <stdatomic.h> is
+   built on them. All are sequentially consistent: memory orders are ignored. */
+#define __atomic_load_n(p, o) (*(p))
+#define __atomic_store_n(p, v, o) ((void)__atomic_exchange_n(p, v, o))
+#define __atomic_exchange_n(p, v, o) ({ __typeof__(p) __p = (p); __typeof__(*__p) __v = (v); \
+  __asm__ __volatile__("xchg %0, %1" : "+r"(__v), "+m"(*__p)); __v; })
+/* If *p equals *e, stores d into *p; else stores *p into *e. Returns whether it stored. */
+#define __atomic_compare_exchange_n(p, e, d, weak, o, o2) ({ __typeof__(p) __p = (p); __typeof__(e) __e = (e); __typeof__(*__p) __d = (d); _Bool __ok; \
+  __asm__ __volatile__("lock cmpxchg %3, %1\n\tsete %0" : "=q"(__ok), "+m"(*__p), "+a"(*__e) : "r"(__d) : "cc"); __ok; })
+#define __atomic_fetch_add(p, v, o) ({ __typeof__(p) __p = (p); __typeof__(*__p) __v = (v); \
+  __asm__ __volatile__("lock xadd %0, %1" : "+r"(__v), "+m"(*__p) : : "cc"); __v; })
+#define __atomic_fetch_sub(p, v, o) __atomic_fetch_add(p, -(v), o)
+#define __rcc_atomic_rmw(p, op, v) ({ __typeof__(p) __q = (p); __typeof__(*__q) __old = *__q, __w = (v); \
+  while (!__atomic_compare_exchange_n(__q, &__old, __old op __w, 0, 0, 0)); __old; })
+#define __atomic_fetch_and(p, v, o) __rcc_atomic_rmw(p, &, v)
+#define __atomic_fetch_or(p, v, o) __rcc_atomic_rmw(p, |, v)
+#define __atomic_fetch_xor(p, v, o) __rcc_atomic_rmw(p, ^, v)
