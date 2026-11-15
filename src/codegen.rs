@@ -1,7 +1,7 @@
 // x86-64 System V code generator. A simple stack machine in the style of
 // chibicc: every expression leaves its value in %rax (or %xmm0 for floats).
 use crate::lex::error_at;
-use crate::parse::{Node, Obj, Op, NK};
+use crate::parse::{AsmClass, AsmOp, Node, Obj, Op, NK};
 use crate::types::*;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
@@ -10,6 +10,24 @@ const ARG8: [&str; 6] = ["%dil", "%sil", "%dl", "%cl", "%r8b", "%r9b"];
 const ARG16: [&str; 6] = ["%di", "%si", "%dx", "%cx", "%r8w", "%r9w"];
 const ARG32: [&str; 6] = ["%edi", "%esi", "%edx", "%ecx", "%r8d", "%r9d"];
 const ARG64: [&str; 6] = ["%rdi", "%rsi", "%rdx", "%rcx", "%r8", "%r9"];
+
+/// General-purpose registers by their 16-bit names. An asm statement takes the
+/// registers of its operands from the first nine; the rest are callee-saved.
+const GP: [&str; 14] = ["ax", "cx", "dx", "si", "di", "r8", "r9", "r10", "r11", "bx", "r12", "r13", "r14", "r15"];
+
+/// The name of a general-purpose register at an operand size; size 0 is the high byte (`%ah`).
+fn reg_name(r: &str, size: i64) -> String {
+    if r.starts_with('r') {
+        return format!("%{}{}", r, ["", "b", "w", "", "d"].get(size as usize).unwrap_or(&""));
+    }
+    match size {
+        0 => format!("%{}h", &r[..1]),
+        1 => format!("%{}l", r.trim_end_matches('x')),
+        2 => format!("%{}", r),
+        4 => format!("%e{}", r),
+        _ => format!("%r{}", r),
+    }
+}
 
 macro_rules! emit {
     ($s:expr, $($arg:tt)*) => { writeln!($s.out, $($arg)*).unwrap() };
@@ -1178,6 +1196,134 @@ impl<'a> Gen<'a> {
         }
     }
 
+    /// An asm statement with operands. Register operands are locals (the parser
+    /// arranged that), so they are loaded and stored without evaluating anything.
+    fn gen_asm(&mut self, n: &Node, text: &str, ops: &[AsmOp], clobbers: &[String]) {
+        let fail = |msg: &str| -> ! { error_at(n.loc.0, n.loc.1, msg) };
+        self.has_asm = true;
+        // General registers in the clobber list, under any of their names ("rax", "%eax", "al").
+        let clob: Vec<&str> = clobbers.iter().filter_map(|c| GP.iter().copied().find(|r| [0, 1, 2, 4, 8].iter().any(|&s| reg_name(r, s)[1..] == *c.trim_start_matches('%')))).collect();
+
+        // Each register operand gets the register its constraint names, else a
+        // free one that is not clobbered; so does the address of a memory operand
+        // that is not a variable. An input tied to an output shares its register.
+        let fixed = |c: char| Some(match c { 'a' | 'A' => "ax", 'b' => "bx", 'c' => "cx", 'd' => "dx", 'S' => "si", 'D' => "di", _ => return None });
+        let mem: Vec<Option<String>> = ops.iter().map(|o| if o.class == AsmClass::Mem { self.direct(&o.node) } else { None }).collect();
+        let tied: Vec<Option<usize>> = ops.iter().map(|o| o.cons.parse().ok()).collect();
+        let mut reg: Vec<Option<&str>> = ops.iter().map(|o| if o.class == AsmClass::Reg { o.cons.chars().find_map(fixed) } else { None }).collect();
+        for (i, o) in ops.iter().enumerate() {
+            let wanted = match o.class {
+                AsmClass::Reg => reg[i].is_none() && tied[i].is_none(),
+                AsmClass::Mem => mem[i].is_none(),
+                AsmClass::Imm => false,
+            };
+            if wanted {
+                reg[i] = GP[..9].iter().copied().find(|r| !clob.contains(r) && !reg.contains(&Some(*r)));
+                if reg[i].is_none() {
+                    fail("too many register operands in an asm statement");
+                }
+            }
+        }
+        for (i, t) in tied.iter().enumerate() {
+            if let Some(t) = t {
+                reg[i] = match ops.get(*t) {
+                    Some(o) if o.out && o.class == AsmClass::Reg => reg[*t],
+                    _ => fail("an asm input can be tied only to a register output"),
+                };
+            }
+        }
+
+        // The text of every operand, per size: `%0`, `%b0`, `%w0`, `%k0`, `%q0`, `%h0`.
+        let operand = |i: usize, modifier: char| -> String {
+            let o = &ops[i];
+            let size = match modifier {
+                'b' => 1,
+                'w' => 2,
+                'k' => 4,
+                'q' => 8,
+                'h' => 0,
+                ' ' | 'c' => o.node.ty.size(),
+                _ => fail("this operand modifier is not supported in an asm template"),
+            };
+            match (o.class, &o.node.kind) {
+                (AsmClass::Imm, NK::Num(v)) => format!("{}{}", if modifier == 'c' { "" } else { "$" }, v),
+                (AsmClass::Mem, _) => mem[i].clone().unwrap_or_else(|| format!("({})", reg_name(reg[i].unwrap(), 8))),
+                _ if [0, 1, 2, 4, 8].contains(&size) => reg_name(reg[i].unwrap(), size),
+                _ => fail("an asm operand of this size cannot be in a register"),
+            }
+        };
+        let mut code = String::new();
+        let mut it = text.chars().peekable();
+        while let Some(c) = it.next() {
+            if c != '%' || it.peek() == Some(&'%') {
+                code.push(c);
+                if c == '%' {
+                    it.next(); // `%%` is a literal `%`
+                }
+                continue;
+            }
+            let modifier = if it.peek().is_some_and(|c| c.is_ascii_alphabetic()) { it.next().unwrap() } else { ' ' };
+            let i = if it.peek() == Some(&'[') {
+                let name: String = it.by_ref().skip(1).take_while(|c| *c != ']').collect();
+                ops.iter().position(|o| o.name.as_deref() == Some(name.as_str()))
+            } else {
+                let mut digits = String::new();
+                while let Some(d) = it.next_if(|c| c.is_ascii_digit()) {
+                    digits.push(d);
+                }
+                digits.parse().ok().filter(|i| *i < ops.len())
+            };
+            match i {
+                Some(i) => code.push_str(&operand(i, modifier)),
+                None => fail("invalid operand reference in an asm template"),
+            }
+        }
+        let slots: Vec<String> = ops.iter().enumerate().map(|(i, o)| if o.class == AsmClass::Reg { operand(i, ' '); self.direct(&o.node).unwrap() } else { String::new() }).collect();
+
+        // Callee-saved registers the statement uses are preserved around it; the
+        // padding keeps %rsp aligned in case the template calls a function.
+        let saved: Vec<&str> = GP[9..].iter().copied().filter(|r| clob.contains(r) || reg.contains(&Some(*r))).collect();
+        let pad = (self.depth + saved.len() as i64) % 2;
+        for r in &saved {
+            emit!(self, "  push {}", reg_name(r, 8));
+        }
+        if pad == 1 {
+            emit!(self, "  sub $8, %rsp");
+        }
+        self.depth += saved.len() as i64 + pad;
+        // Addresses first: computing one may use any register.
+        let addrs: Vec<usize> = (0..ops.len()).filter(|&i| ops[i].class == AsmClass::Mem && mem[i].is_none()).collect();
+        for &i in &addrs {
+            self.gen_addr(&ops[i].node);
+            self.push();
+        }
+        for &i in addrs.iter().rev() {
+            self.pop(&reg_name(reg[i].unwrap(), 8));
+        }
+        for (i, o) in ops.iter().enumerate().filter(|(_, o)| o.class == AsmClass::Reg && o.inp) {
+            // Narrow values are zero-extended, whatever part the template uses.
+            let (ins, size) = match o.node.ty.size() {
+                1 => ("movzbl", 4),
+                2 => ("movzwl", 4),
+                size => ("mov", size),
+            };
+            emit!(self, "  {} {}, {}", ins, slots[i], reg_name(reg[i].unwrap(), size));
+        }
+        if !code.is_empty() {
+            emit!(self, "  {}", code);
+        }
+        for (i, _) in ops.iter().enumerate().filter(|(_, o)| o.class == AsmClass::Reg && o.out) {
+            emit!(self, "  mov {}, {}", operand(i, ' '), slots[i]);
+        }
+        if pad == 1 {
+            emit!(self, "  add $8, %rsp");
+        }
+        for r in saved.iter().rev() {
+            emit!(self, "  pop {}", reg_name(r, 8));
+        }
+        self.depth -= saved.len() as i64 + pad;
+    }
+
     // ----- statements -----
 
     fn gen_stmt(&mut self, n: &Node) {
@@ -1294,6 +1440,7 @@ impl<'a> Gen<'a> {
                 self.has_asm = true;
                 emit!(self, "  {}", text);
             }
+            NK::AsmOps(text, ops, clobbers) => self.gen_asm(n, text, ops, clobbers),
             NK::GotoExpr(e) => {
                 self.gen_expr(e);
                 emit!(self, "  jmp *%rax");
