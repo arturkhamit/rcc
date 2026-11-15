@@ -54,10 +54,25 @@ pub enum NK {
     Switch { cond: Box<Node>, body: Box<Node>, cases: Vec<(i64, i64, String)>, default: Option<String>, brk: String }, // case lo ... hi
     GotoExpr(Box<Node>), // GNU `goto *p`
     Asm(String),         // basic asm statement
+    AsmOps(String, Vec<AsmOp>, Vec<String>), // asm with operands: template, operands, clobbers
     Label(String, Box<Node>),
     Goto(String),
     Block(Vec<Node>),
     ExprStmt(Box<Node>),
+}
+
+#[derive(Clone, Copy, PartialEq)]
+pub enum AsmClass { Reg, Mem, Imm }
+
+/// An operand of an asm statement.
+#[derive(Clone)]
+pub struct AsmOp {
+    pub cons: String,         // the constraint without its `=`, `+`, `&`, `%` modifiers
+    pub name: Option<String>, // `[name]`
+    pub class: AsmClass,
+    pub node: Node, // Reg: a local holding the value; Mem: an lvalue; Imm: a constant
+    pub out: bool,  // the template writes it
+    pub inp: bool,  // the template reads it
 }
 
 pub struct Local {
@@ -931,8 +946,11 @@ impl Parser {
                     self.pos += 1;
                     continue;
                 }
+                // `_Atomic(type)` is a type specifier (below); a bare `_Atomic` is a qualifier.
                 "const" | "volatile" | "auto" | "register" | "restrict" | "__restrict" | "__restrict__" | "_Noreturn"
-                | "__const" | "__volatile__" | "__volatile" | "_Atomic" => {
+                | "__const" | "__volatile__" | "__volatile" | "_Atomic"
+                    if s != "_Atomic" || !self.is_at(1, "(") =>
+                {
                     self.pos += 1;
                     continue;
                 }
@@ -955,7 +973,7 @@ impl Parser {
                 Some(VS::Typedef(t)) if self.tok().kind == TK::Ident => Some(t.clone()),
                 _ => None,
             };
-            if matches!(s.as_str(), "struct" | "union" | "enum" | "typeof" | "__typeof__" | "__typeof") || td.is_some() {
+            if matches!(s.as_str(), "struct" | "union" | "enum" | "typeof" | "__typeof__" | "__typeof" | "_Atomic") || td.is_some() {
                 if counter != 0 {
                     break;
                 }
@@ -964,7 +982,7 @@ impl Parser {
                     "struct" => self.struct_decl(false),
                     "union" => self.struct_decl(true),
                     "enum" => self.enum_spec(),
-                    "typeof" | "__typeof__" | "__typeof" => {
+                    "typeof" | "__typeof__" | "__typeof" | "_Atomic" => {
                         self.expect("(");
                         let t = if self.is_typename() { self.typename() } else { self.expr().ty };
                         self.expect(")");
@@ -1774,16 +1792,24 @@ impl Parser {
 
     fn union_init(&mut self, init: &mut Init) {
         self.expect("{");
-        if self.is(".") {
-            let i = self.struct_designator(&init.ty.clone());
-            init.mem = i;
-            self.designation(&mut init.children[i]);
-        } else if !self.is("}") && !init.children.is_empty() {
-            init.mem = 0;
-            self.initializer2(&mut init.children[0]);
+        let mut first = true;
+        while !self.consume_end() {
+            if !first {
+                self.expect(",");
+            }
+            if self.is(".") {
+                // The union holds the member designated last.
+                let i = self.struct_designator(&init.ty.clone());
+                init.mem = i;
+                self.designation(&mut init.children[i]);
+            } else if first && !init.children.is_empty() {
+                init.mem = 0;
+                self.initializer2(&mut init.children[0]);
+            } else {
+                self.skip_excess();
+            }
+            first = false;
         }
-        self.consume(",");
-        self.expect("}");
     }
 
     fn initializer2(&mut self, init: &mut Init) {
@@ -1904,7 +1930,15 @@ impl Parser {
             }
             Type::Struct(sd) => {
                 if let Some(e) = &init.expr {
-                    err(e.loc, "initializer element is not constant");
+                    // GNU: a compound literal is a constant here; its bytes are copied.
+                    let lit = match &e.kind {
+                        NK::GVar(name) if name.starts_with(".L.lit") => self.globals.iter().rev().find(|g| g.name == *name),
+                        _ => None,
+                    };
+                    let Some((data, g)) = lit.and_then(|g| Some((g.init.as_ref()?, g))) else { err(e.loc, "initializer element is not constant") };
+                    buf[off as usize..off as usize + data.len()].copy_from_slice(data);
+                    relocs.extend(g.relocs.iter().map(|r| Reloc { offset: r.offset + off, label: r.label.clone(), addend: r.addend }));
+                    return;
                 }
                 let sd = sd.borrow();
                 for (i, (m, c)) in sd.members.iter().zip(&init.children).enumerate() {
@@ -2210,27 +2244,20 @@ impl Parser {
             return mk(NK::Nop, void, loc);
         }
         if self.is_asm() {
-            // Only the empty template (an optimization barrier) is accepted; its
-            // operands are evaluated for their side effects.
             self.pos += 1;
             while self.consume("volatile") || self.consume("inline") || self.consume("__volatile__") {}
             self.expect("(");
-            if self.tok().kind == TK::Str && !self.tok().bytes.is_empty() && self.is_at(1, ")") {
+            let text = self.string_arg();
+            if self.consume(")") {
                 // Basic asm (no operands) is emitted as written.
-                let text = self.string_arg();
-                self.expect(")");
                 self.expect(";");
                 return mk(NK::Asm(text), void, loc);
             }
-            if self.tok().kind != TK::Str || !self.tok().bytes.is_empty() {
-                // shortcut: asm with operands needs constraint-driven register allocation.
-                self.err("inline assembly with operands is not supported");
-            }
-            self.pos += 1;
-            // Sections after the template: outputs, inputs, clobbers. An input whose
-            // constraint is a digit is tied to that output: with an empty template
-            // the statement then just copies it.
-            let (mut section, mut outs, mut out) = (0, Vec::<Node>::new(), vec![]);
+            // Sections after the template: outputs, inputs, clobbers. A register
+            // operand goes through a local: assigned before the statement if the
+            // template reads it, copied to its lvalue afterwards if the template
+            // writes it. The code generator then has nothing to evaluate.
+            let (mut section, mut ops, mut clobbers, mut pre, mut post) = (0, vec![], vec![], vec![], vec![]);
             while !self.consume(")") {
                 if self.consume(":") {
                     section += 1;
@@ -2239,29 +2266,64 @@ impl Parser {
                 if self.consume(",") {
                     continue;
                 }
-                if self.consume("[") {
-                    self.pos += 1;
+                if section == 3 {
+                    clobbers.push(self.string_arg());
+                    continue;
+                }
+                if section > 3 {
+                    self.err("asm goto is not supported");
+                }
+                let name = if self.consume("[") { Some(self.ident()) } else { None };
+                if name.is_some() {
                     self.expect("]");
                 }
-                if self.tok().kind != TK::Str {
-                    self.err("invalid asm operand");
-                }
-                let tied = String::from_utf8_lossy(&self.tok().bytes).parse::<usize>().ok();
-                self.pos += 1;
-                if self.consume("(") {
-                    let e = self.expr();
-                    self.expect(")");
-                    let e = match tied.filter(|i| section == 2 && *i < outs.len()) {
-                        Some(i) => new_assign(outs[i].clone(), e, loc),
-                        None => e,
-                    };
-                    if section == 1 {
-                        outs.push(e.clone());
+                let cons = self.string_arg();
+                self.expect("(");
+                let e = self.expr();
+                self.expect(")");
+                let (out, inp) = (section == 1, section == 2 || cons.contains('+'));
+                let has = |set: &str| cons.chars().any(|c| set.contains(c));
+                let ty = decay(&e.ty);
+                let scalar = ty.size() <= 8 && (ty.is_numeric() || matches!(*ty, Type::Ptr(_)));
+                let (class, node) = if has("@") {
+                    self.err("asm flag outputs (\"=@cc...\") are not supported")
+                } else if has("0123456789") || (scalar && has("rqQRlgXabcdSDA")) {
+                    let tmp = self.new_lvar("", if out { e.ty.clone() } else { ty });
+                    let var = self.lvar(tmp, loc);
+                    if out {
+                        // The lvalue is evaluated once, before the statement (a
+                        // bitfield has no address: it is evaluated again to store).
+                        let lv = if matches!(&e.kind, NK::LVar(_) | NK::GVar(_)) || matches!(&e.kind, NK::Member(_, m) if m.bit_width >= 0) {
+                            e
+                        } else {
+                            let p = self.new_lvar("", ptr_to(e.ty.clone()));
+                            pre.push(new_assign(self.lvar(p, loc), new_addr(e, loc), loc));
+                            new_deref(self.lvar(p, loc), loc)
+                        };
+                        if inp {
+                            pre.push(new_assign(var.clone(), lv.clone(), loc));
+                        }
+                        post.push(new_assign(lv, var.clone(), loc));
+                    } else {
+                        pre.push(new_assign(var.clone(), e, loc));
                     }
-                    out.push(mk(NK::ExprStmt(bx(mk(NK::Cast(bx(e)), void.clone(), loc))), void.clone(), loc));
-                }
+                    (AsmClass::Reg, var)
+                } else if has("moVgX") {
+                    (AsmClass::Mem, e)
+                } else if has("inesIJKLMNO") && is_const(&e) && e.ty.is_integer() {
+                    (AsmClass::Imm, lnum(eval(&e), loc))
+                } else {
+                    // shortcut: no SSE ("x"), x87 ("t", "u") or symbolic immediate operands; add them when a program needs one.
+                    self.err(&format!("asm operand constraint \"{}\" is not supported for this operand", cons))
+                };
+                let cons = cons.chars().filter(|c| !"=+&%".contains(*c)).collect();
+                ops.push(AsmOp { cons, name, class, node, out, inp });
             }
             self.expect(";");
+            let stmt = |e: Node| mk(NK::ExprStmt(bx(e)), ty_void(), loc);
+            let mut out: Vec<Node> = pre.into_iter().map(stmt).collect();
+            out.push(mk(NK::AsmOps(text, ops, clobbers), void.clone(), loc));
+            out.extend(post.into_iter().map(stmt));
             return mk(NK::Block(out), void, loc);
         }
         let e = self.expr();
