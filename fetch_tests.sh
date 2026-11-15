@@ -15,6 +15,9 @@ get https://github.com/madler/zlib/releases/download/v1.3.1/zlib-1.3.1.tar.gz zl
 get https://sourceware.org/pub/bzip2/bzip2-1.0.8.tar.gz bzip2/bzip2-1.0.8
 [ -d chibicc ] || git clone -q --depth 1 https://github.com/rui314/chibicc
 [ -d tinycc ] || git clone -q --depth 1 https://github.com/TinyCC/tinycc
+[ -d lz4 ] || git clone -q --depth 1 --branch v1.10.0 https://github.com/lz4/lz4
+[ -d zstd ] || git clone -q --depth 1 --branch v1.5.6 https://github.com/facebook/zstd
+[ -d quickjs ] || git clone -q --depth 1 https://github.com/bellard/quickjs
 if [ ! -d gcc-ts ]; then
   git clone -q --depth 1 --filter=blob:none --sparse https://github.com/gcc-mirror/gcc gcc-ts
   git -C gcc-ts sparse-checkout set gcc/testsuite/gcc.c-torture/execute

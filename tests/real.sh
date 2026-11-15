@@ -1,6 +1,7 @@
 #!/bin/bash
-# Builds real programs with rcc and checks them: Lua 5.4 (its own test suite)
-# and SQLite (same output as a gcc build). Sources are expected in tests/ext.
+# Builds real programs with rcc and checks them: Lua 5.4 (its own test suite),
+# SQLite (same output as a gcc build), and projects built with their own build
+# systems and checked by their own tests. Sources are expected in tests/ext.
 cd "$(dirname "$0")/.." || exit 1
 RCC=$PWD/target/release/rcc; EXT=$PWD/tests/ext
 tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
@@ -54,6 +55,17 @@ if [ -d $EXT/zlib/zlib-1.3.1 ]; then
 fi
 if [ -d $EXT/chibicc ]; then
   (cd $EXT/chibicc && make clean && make CC=$RCC && make test CC=$RCC) > $tmp/chibicc.log 2>&1; check chibicc $?
+fi
+if [ -d $EXT/lz4 ]; then
+  (cd $EXT/lz4 && make clean && make CC=$RCC -C tests test-lz4-essentials test-frametest test-fuzzer FUZZER_TIME=-T10s) > $tmp/lz4.log 2>&1; check lz4 $?
+fi
+if [ -d $EXT/zstd ]; then
+  # The command-line tests, then the unit tests and five seconds of fuzzing.
+  (cd $EXT/zstd && make clean && make CC=$RCC -C tests shortest && make CC=$RCC -C tests fuzzer && tests/fuzzer -T5s) > $tmp/zstd.log 2>&1; check zstd $?
+fi
+if [ -d $EXT/quickjs ]; then
+  # Without Temporal and Intl: they need __int128.
+  (cd $EXT/quickjs && make clean && make CC=$RCC CONFIG_LTO= CONFIG_TEMPORAL_INTL= all test) > $tmp/quickjs.log 2>&1; check quickjs $?
 fi
 if [ -d $EXT/tinycc ]; then
   # tcc built by rcc must compile and run its example programs and itself.
