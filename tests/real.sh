@@ -64,8 +64,8 @@ if [ -d $EXT/zstd ]; then
   (cd $EXT/zstd && make clean && make CC=$RCC -C tests shortest && make CC=$RCC -C tests fuzzer && tests/fuzzer -T5s) > $tmp/zstd.log 2>&1; check zstd $?
 fi
 if [ -d $EXT/quickjs ]; then
-  # Without Temporal and Intl: they need __int128.
-  (cd $EXT/quickjs && make clean && make CC=$RCC CONFIG_LTO= CONFIG_TEMPORAL_INTL= all test) > $tmp/quickjs.log 2>&1; check quickjs $?
+  # In UTC: one of its Intl tests expects an hour that some time zones change (with gcc too).
+  (cd $EXT/quickjs && make clean && TZ=UTC make CC=$RCC CONFIG_LTO= all test) > $tmp/quickjs.log 2>&1; check quickjs $?
 fi
 if [ -d $EXT/tinycc ]; then
   # tcc built by rcc must compile and run its example programs and itself.

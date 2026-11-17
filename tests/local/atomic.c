@@ -9,9 +9,30 @@ static atomic_flag lock = ATOMIC_FLAG_INIT;
 static long guarded; // protected by `lock`
 static _Atomic(uint32_t) bits;
 
+// Plain operators on atomic objects are atomic too.
+static _Atomic int plus, minus, mixed;
+static _Atomic unsigned toggled; // only xor: the order of the threads does not matter
+static _Atomic unsigned char small;
+static _Atomic(long) *indirect = &counter;
+static struct { char pad; _Atomic short field; } in_struct;
+static _Atomic double real;
+static atomic_int last;
+
 static void *worker(void *arg) {
   long id = (long)arg;
   for (int i = 0; i < 100000; i++) {
+    plus++;
+    --minus;
+    mixed += 3;
+    mixed -= 1;
+    toggled ^= 1u << id;
+    small += 1;
+    *indirect += 2;
+    in_struct.field++;
+    // (`real += 0.5` would be atomic too, but gcc needs libatomic to link it.)
+    double seen = atomic_load(&real);
+    while (!atomic_compare_exchange_weak(&real, &seen, seen + 0.5)) {}
+    last = (int)id;
     atomic_fetch_add(&counter, 1);
     atomic_fetch_xor(&bits, 1u << id);
     while (atomic_flag_test_and_set(&lock)) {}
@@ -73,5 +94,27 @@ int main(void) {
   for (long i = 0; i < 4; i++) pthread_create(&t[i], 0, worker, (void *)i);
   for (int i = 0; i < 4; i++) pthread_join(t[i], 0);
   printf("threads: %ld %ld %x\n", atomic_load(&counter), guarded, atomic_load(&bits));
+  printf("operators: %d %d %d %x %d %d %g %d\n", plus, minus, mixed, toggled, small, in_struct.field, real, last >= 0 && last < 4);
+
+  // The values of the operator expressions, and pointers.
+  _Atomic int v = 10;
+  int r1 = v++, r2 = ++v, r3 = (v += 5), r4 = (v = 100), r5 = v--;
+  printf("values: %d %d %d %d %d %d\n", r1, r2, r3, r4, r5, v);
+  int arr[4] = {1, 2, 3, 4};
+  _Atomic(int *) ap = arr;
+  ap += 2;
+  int *prev = ap++;
+  printf("pointer: %d %d\n", *prev, *ap);
+  _Atomic _Bool ab = 0;
+  ab |= 1;
+  _Atomic float af = 1.5f;
+  af = af * 2;
+  printf("bool, float: %d %g\n", ab, af);
+  // typeof drops _Atomic; a qualified pointee is a distinct type.
+  __typeof__(v) plain = 7;
+  plain++;
+  const char *cs = "";
+  printf("types: %d %d %d %d\n", plain, _Generic(cs, char *: 1, const char *: 2), _Generic(&v, int *: 1, _Atomic int *: 2),
+         __builtin_types_compatible_p(const int, int));
   return 0;
 }
