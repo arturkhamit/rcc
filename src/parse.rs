@@ -7,7 +7,7 @@ use std::rc::Rc;
 
 pub type Loc = (u32, u32); // (file, line)
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Op { Add, Sub, Mul, Div, Mod, BitAnd, BitOr, BitXor, Shl, Shr, Eq, Ne, Lt, Le }
 
 #[derive(Clone)]
@@ -40,6 +40,7 @@ pub enum NK {
     Cast(Box<Node>),
     Call { f: Box<Node>, args: Vec<Node>, ret_buf: Option<usize> },
     MemZero(usize),
+    Undef(usize), // a statement: the local is declared here without an initializer
     Alloca(Box<Node>),
     VlaAlloc { var: usize, size: Box<Node>, save: usize },
     VaStart(Box<Node>),
@@ -106,13 +107,14 @@ pub struct Obj {
 }
 
 /// Attributes of a symbol: `weak`, `alias("target")`, `section("name")`,
-/// `constructor`, `destructor`, `visibility("hidden")` and `asm("name")`.
+/// `constructor`, `destructor`, `noinline`, `visibility("hidden")` and `asm("name")`.
 #[derive(Default, Clone)]
 pub struct SymAttr {
     pub weak: bool,
     pub hidden: bool,
     pub ctor: bool,
     pub dtor: bool,
+    pub noinline: bool,
     pub alias: Option<String>,
     pub section: Option<String>,
     asm_name: Option<String>,
@@ -180,7 +182,7 @@ const TYPE_KW: &[&str] = &[
     "_Alignas", "signed", "unsigned", "const", "volatile", "auto", "register", "restrict", "__restrict",
     "__restrict__", "_Noreturn", "float", "double", "typeof", "__typeof__", "__typeof", "inline", "__inline",
     "__inline__", "_Thread_local", "__thread", "_Atomic", "__attribute__", "__signed__", "__signed", "__const",
-    "__volatile__", "__volatile",
+    "__volatile__", "__volatile", "__int128",
 ];
 
 /// Bytes a flexible array member's initializer adds after its struct.
@@ -193,6 +195,23 @@ fn flex_extra(init: &Init) -> i64 {
 
 fn err(loc: Loc, msg: &str) -> ! {
     error_at(loc.0, loc.1, msg)
+}
+
+/// The qualifier a keyword stands for (0 for `restrict`, `register` and the like).
+fn qualifier(keyword: &str) -> u8 {
+    match keyword {
+        "const" | "__const" => Q_CONST,
+        "volatile" | "__volatile__" | "__volatile" => Q_VOLATILE,
+        "_Atomic" => Q_ATOMIC,
+        _ => 0,
+    }
+}
+
+/// True for an atomic type that fits a register: its operators are made atomic.
+/// shortcut: larger atomic objects (structs, long double) are read and written
+/// like plain ones; they would need a lock, as in libatomic.
+fn atomic_scalar(ty: &Ty) -> bool {
+    ty.is_atomic() && ty.size() <= 8 && (ty.is_numeric() || matches!(**ty, Type::Ptr(_)))
 }
 
 fn mk(kind: NK, ty: Ty, loc: Loc) -> Node {
@@ -265,7 +284,7 @@ fn bf(n: Node) -> Node {
 
 fn arith(op: Op, l: Node, r: Node, loc: Loc) -> Node {
     let (l, r) = (bf(l), bf(r));
-    if !l.ty.is_numeric() && l.ty.base().is_none() && !matches!(*l.ty, Type::Func(_)) || r.ty.is_struct() {
+    if !l.ty.is_numeric() && l.ty.base().is_none() && !matches!(*l.ty, Type::Func(_)) || r.ty.is_record() {
         err(loc, "invalid operands");
     }
     let ty = common_type(&l.ty, &r.ty);
@@ -377,7 +396,7 @@ fn new_assign(l: Node, r: Node, loc: Loc) -> Node {
     if let Type::Array(..) | Type::Vla(..) = &*l.ty {
         err(loc, "not an lvalue");
     }
-    let r = if l.ty.is_struct() { r } else { new_cast(r, l.ty.clone()) };
+    let r = if l.ty.is_record() { r } else { new_cast(r, l.ty.clone()) };
     let ty = l.ty.clone();
     mk(NK::Assign(bx(l), bx(r)), ty, loc)
 }
@@ -388,7 +407,9 @@ fn new_comma(l: Node, r: Node, loc: Loc) -> Node {
 }
 
 fn new_member(n: Node, m: &Member, loc: Loc) -> Node {
-    mk(NK::Member(bx(n), m.clone()), m.ty.clone(), loc)
+    // A member of a const or volatile object is const or volatile too.
+    let ty = m.ty.qualify(n.ty.quals & (Q_CONST | Q_VOLATILE));
+    mk(NK::Member(bx(n), m.clone()), ty, loc)
 }
 
 // ---------------------------------------------------------------------------
@@ -484,6 +505,86 @@ fn eval2(n: &Node, mut label: Option<&mut String>) -> i64 {
     wrap(v, &n.ty)
 }
 
+/// The value of a constant expression as a 128-bit integer; None if it is not one.
+fn eval128(n: &Node) -> Option<i128> {
+    let Some(unsigned) = n.ty.i128() else {
+        // Of an ordinary integer type: evaluated as such, then widened.
+        if !is_const(n) || !n.ty.is_integer() {
+            return None;
+        }
+        let v = eval(n);
+        return Some(if n.ty.is_unsigned() && n.ty.size() == 8 { v as u64 as i128 } else { v as i128 });
+    };
+    Some(match &n.kind {
+        NK::Cast(l) => eval128(l)?,
+        NK::Neg(l) => eval128(l)?.wrapping_neg(),
+        NK::BitNot(l) => !eval128(l)?,
+        NK::Cond(c, t, e) => eval128(if eval128(c)? != 0 { t } else { e })?,
+        NK::Bin(op, l, r) => {
+            let (a, b) = (eval128(l)?, eval128(r)?);
+            let (ua, ub) = (a as u128, b as u128);
+            match op {
+                Op::Add => a.wrapping_add(b),
+                Op::Sub => a.wrapping_sub(b),
+                Op::Mul => a.wrapping_mul(b),
+                Op::Div | Op::Mod if b == 0 => return None,
+                Op::Div if unsigned => (ua / ub) as i128,
+                Op::Div => a.wrapping_div(b),
+                Op::Mod if unsigned => (ua % ub) as i128,
+                Op::Mod => a.wrapping_rem(b),
+                Op::BitAnd => a & b,
+                Op::BitOr => a | b,
+                Op::BitXor => a ^ b,
+                Op::Shl => a.wrapping_shl(b as u32),
+                Op::Shr if unsigned => ua.wrapping_shr(b as u32) as i128,
+                Op::Shr => a.wrapping_shr(b as u32),
+                _ => return None,
+            }
+        }
+        _ => return None,
+    })
+}
+
+/// Calls `f` for every node directly below `n`.
+fn children_mut(n: &mut Node, f: &mut dyn FnMut(&mut Node)) {
+    match &mut n.kind {
+        NK::Bin(_, l, r) | NK::LogAnd(l, r) | NK::LogOr(l, r) | NK::Assign(l, r) | NK::Comma(l, r) => {
+            f(l);
+            f(r);
+        }
+        NK::Neg(l) | NK::Not(l) | NK::BitNot(l) | NK::Addr(l) | NK::Deref(l) | NK::Cast(l) | NK::Alloca(l) | NK::VaStart(l) | NK::GotoExpr(l) | NK::ExprStmt(l)
+        | NK::Member(l, _) | NK::Label(_, l) => f(l),
+        NK::VlaAlloc { size, .. } => f(size),
+        NK::Cond(c, t, e) => {
+            f(c);
+            f(t);
+            f(e);
+        }
+        NK::Call { f: callee, args, .. } => {
+            f(callee);
+            args.iter_mut().for_each(f);
+        }
+        NK::StmtExpr(v) | NK::Block(v) => v.iter_mut().for_each(f),
+        NK::Return(e) => e.iter_mut().for_each(|e| f(e)),
+        NK::If(c, t, e) => {
+            f(c);
+            f(t);
+            e.iter_mut().for_each(|e| f(e));
+        }
+        NK::For { init, cond, inc, body, .. } => {
+            [init, cond, inc].into_iter().flatten().for_each(|e| f(e));
+            f(body);
+        }
+        NK::Do { body, cond, .. } | NK::Switch { cond, body, .. } => {
+            f(body);
+            f(cond);
+        }
+        NK::AsmOps(_, ops, _) => ops.iter_mut().for_each(|o| f(&mut o.node)),
+        NK::Nop | NK::Num(_) | NK::FNum(_) | NK::LNum(..) | NK::LVar(_) | NK::GVar(_) | NK::MemZero(_) | NK::Undef(_) | NK::LabelAddr(_) | NK::FrameAddr | NK::Goto(_)
+        | NK::Asm(_) => {}
+    }
+}
+
 fn eval_bool(n: &Node) -> bool {
     if n.ty.is_flonum() {
         return eval_double(n) != 0.0;
@@ -552,6 +653,8 @@ pub struct Parser {
     switches: Vec<SwitchCtx>,
     uniq: usize,
     va_elem: Ty,
+    i128: [Ty; 2],    // the 128-bit integer types: signed, unsigned
+    uses_i128: bool, // some declaration so far has such a type
     vla_pending: Vec<Node>, // size computations of VLA types parsed so far
     vla_saves: Vec<usize>,
     in_params: usize,
@@ -620,7 +723,7 @@ fn new_parser(mut toks: Vec<Token>) -> Parser {
         mem("overflow_arg_area", ptr_to(ty_char()), 8),
         mem("reg_save_area", ptr_to(ty_char()), 16),
     ];
-    let va_elem: Ty = Rc::new(Type::Struct(Rc::new(RefCell::new(SDef { is_union: false, members, size: 24, align: 8, complete: true }))));
+    let va_elem: Ty = Ty::new(Type::Struct(Rc::new(RefCell::new(SDef { is_union: false, members, size: 24, align: 8, complete: true, i128: None }))));
     let mut p = Parser {
         toks,
         pos: 0,
@@ -634,6 +737,8 @@ fn new_parser(mut toks: Vec<Token>) -> Parser {
         cont: None,
         switches: vec![],
         uniq: 0,
+        i128: [ty_i128(false), ty_i128(true)],
+        uses_i128: false,
         va_elem: va_elem.clone(),
         vla_pending: vec![],
         vla_saves: vec![],
@@ -650,6 +755,8 @@ fn new_parser(mut toks: Vec<Token>) -> Parser {
         pack_points,
     };
     p.scopes[0].vars.insert("__builtin_va_list".into(), VS::Typedef(array_of(va_elem, 1)));
+    p.scopes[0].vars.insert("__int128_t".into(), VS::Typedef(p.i128[0].clone()));
+    p.scopes[0].vars.insert("__uint128_t".into(), VS::Typedef(p.i128[1].clone()));
     p
 }
 
@@ -723,6 +830,7 @@ impl Parser {
                     "weak" => self.attr_sym.weak = true,
                     "constructor" => self.attr_sym.ctor = true,
                     "destructor" => self.attr_sym.dtor = true,
+                    "noinline" => self.attr_sym.noinline = true,
                     "alias" | "section" | "visibility" if self.is("(") => {
                         self.pos += 1;
                         let v = self.string_arg();
@@ -774,6 +882,7 @@ impl Parser {
         s.hidden |= base.hidden || d.hidden;
         s.ctor |= base.ctor || d.ctor;
         s.dtor |= base.dtor || d.dtor;
+        s.noinline |= base.noinline || d.noinline;
         for (dst, src) in [(&mut s.alias, d.alias.or(base.alias.clone())), (&mut s.section, d.section.or(base.section.clone()))] {
             if src.is_some() {
                 *dst = src;
@@ -925,9 +1034,11 @@ impl Parser {
         const OTHER: u32 = 1 << 16;
         const SIGNED: u32 = 1 << 17;
         const UNSIGNED: u32 = 1 << 18;
+        const INT128: u32 = 1 << 19;
 
         let mut ty = ty_int();
         let mut counter = 0u32;
+        let mut quals = 0u8;
         (self.attr_packed, self.attr_align, self.attr_mode) = (false, 0, 0);
         self.attr_sym = SymAttr::default();
         self.attr_talign = 0;
@@ -951,6 +1062,7 @@ impl Parser {
                 | "__const" | "__volatile__" | "__volatile" | "_Atomic"
                     if s != "_Atomic" || !self.is_at(1, "(") =>
                 {
+                    quals |= qualifier(&s);
                     self.pos += 1;
                     continue;
                 }
@@ -986,7 +1098,8 @@ impl Parser {
                         self.expect("(");
                         let t = if self.is_typename() { self.typename() } else { self.expr().ty };
                         self.expect(")");
-                        t
+                        // `typeof` of an atomic type is the plain type (as in gcc).
+                        if s == "_Atomic" { t.qualify(Q_ATOMIC) } else { t.without(Q_ATOMIC) }
                     }
                     _ => {
                         self.attr_talign = self.scopes.iter().rev().find_map(|sc| sc.taligns.get(&s)).copied().unwrap_or(0);
@@ -1005,6 +1118,7 @@ impl Parser {
                 "long" => counter += LONG,
                 "float" => counter += FLOAT,
                 "double" => counter += DOUBLE,
+                "__int128" => counter += INT128,
                 "signed" | "__signed__" | "__signed" => counter |= SIGNED,
                 "unsigned" => counter |= UNSIGNED,
                 _ => self.err("invalid type"),
@@ -1031,10 +1145,13 @@ impl Parser {
                 ty_double()
             } else if c == LONG + DOUBLE {
                 ty_ldouble()
+            } else if b == INT128 {
+                self.i128[u as usize].clone()
             } else {
                 self.err("invalid type")
             };
         }
+        self.uses_i128 |= ty.i128().is_some();
         if let Some(a) = attr {
             a.align = self.attr_align;
             a.sym = std::mem::take(&mut self.attr_sym);
@@ -1043,7 +1160,7 @@ impl Parser {
             ty = ty_ints(self.attr_mode, ty.is_unsigned());
             self.attr_mode = 0;
         }
-        ty
+        ty.qualify(quals)
     }
 
     fn pointers(&mut self, mut ty: Ty) -> Ty {
@@ -1051,7 +1168,8 @@ impl Parser {
             self.skip_attrs();
             if self.consume("*") {
                 ty = ptr_to(ty);
-            } else if ["const", "volatile", "restrict", "__restrict", "__restrict__", "__const", "_Atomic"].iter().any(|k| self.is(k)) {
+            } else if ["const", "volatile", "restrict", "__restrict", "__restrict__", "__const", "__volatile__", "__volatile", "_Atomic"].iter().any(|k| self.is(k)) {
+                ty = ty.qualify(qualifier(&self.tok().s));
                 self.pos += 1;
             } else {
                 return ty;
@@ -1136,7 +1254,7 @@ impl Parser {
             let sv = self.new_lvar("", ty_ulong());
             let size = new_binary(Op::Mul, new_cast(e, ty_ulong()), size_of(&ty, loc), loc);
             self.vla_pending.push(new_assign(self.lvar(sv, loc), size, loc));
-            return Rc::new(Type::Vla(ty, sv));
+            return Ty::new(Type::Vla(ty, sv));
         }
         ty
     }
@@ -1188,10 +1306,10 @@ impl Parser {
                 names.push(name.unwrap_or_default());
             }
             if oldstyle {
-                return Rc::new(Type::Func(Rc::new(FuncTy { ret, params, names, variadic: false, oldstyle: true })));
+                return Ty::new(Type::Func(Rc::new(FuncTy { ret, params, names, variadic: false, oldstyle: true })));
             }
         }
-        Rc::new(Type::Func(Rc::new(FuncTy { ret, params, names, variadic, oldstyle: false })))
+        Ty::new(Type::Func(Rc::new(FuncTy { ret, params, names, variadic, oldstyle: false })))
     }
 
     fn typename(&mut self) -> Ty {
@@ -1486,7 +1604,7 @@ impl Parser {
                         }
                         let promoted = params.iter().map(|t| if let Type::Float = **t { ty_double() } else { promote(t) }).collect();
                         self.knr_declared = Some(params);
-                        ty = Rc::new(Type::Func(Rc::new(FuncTy { ret: fty.ret.clone(), params: promoted, names: fty.names.clone(), variadic: false, oldstyle: false })));
+                        ty = Ty::new(Type::Func(Rc::new(FuncTy { ret: fty.ret.clone(), params: promoted, names: fty.names.clone(), variadic: false, oldstyle: false })));
                     }
                     let i = self.declare_func(&name, ty.clone(), &attr);
                     self.globals[i].align = self.globals[i].align.max(align);
@@ -1580,8 +1698,11 @@ impl Parser {
         let loc = self.loc();
         self.expect("{");
         entry.push(self.block());
-        let body = mk(NK::Block(entry), ty_void(), loc);
+        let mut body = mk(NK::Block(entry), ty_void(), loc);
         self.scopes.pop();
+        if self.uses_i128 {
+            self.lower128(&mut body);
+        }
 
         let g = &mut self.globals[i];
         g.params = params;
@@ -1589,6 +1710,123 @@ impl Parser {
         g.vla_saves = std::mem::take(&mut self.vla_saves);
         g.locals = std::mem::take(&mut self.locals);
         g.body = Some(body);
+    }
+
+    // ----- 128-bit integers -----
+
+    /// A call of one of the functions of builtins.h (or libgcc) that implement
+    /// the 128-bit operations.
+    fn call128(&mut self, name: &str, args: Vec<Node>, ret: &Ty, loc: Loc) -> Node {
+        let Some(VS::Global(i)) = self.scopes[0].vars.get(name).cloned() else { err(loc, "128-bit integers need the built-in declarations") };
+        let ret_buf = if ret.is_struct() { Some(self.new_lvar("", ret.clone())) } else { None };
+        let f = self.gvar(i, loc);
+        mk(NK::Call { f: bx(f), args, ret_buf }, ret.clone(), loc)
+    }
+
+    /// The low word of a 128-bit integer.
+    fn low128(n: Node) -> Node {
+        let Type::Struct(sd) = &*n.ty else { unreachable!() };
+        let (word, loc) = (sd.borrow().members[0].clone(), n.loc);
+        new_member(n, &word, loc)
+    }
+
+    /// A 128-bit integer used as a condition: whether it is nonzero.
+    fn truth128(&mut self, c: &mut Node) {
+        if c.ty.i128().is_some() {
+            let (loc, v) = (c.loc, std::mem::replace(c, num(0, c.loc)));
+            *c = self.call128("__rcc_nz128", vec![v], &ty_int(), loc);
+        }
+    }
+
+    /// Rewrites the operations on 128-bit integers in a function body as calls
+    /// and accesses to their two words. Run when the body is complete; until
+    /// then such an integer is an integer like any other to the parser.
+    fn lower128(&mut self, n: &mut Node) {
+        children_mut(n, &mut |c| self.lower128(c));
+        let (loc, wide) = (n.loc, |t: &Ty| t.i128().is_some());
+        match &mut n.kind {
+            NK::If(c, ..) | NK::Cond(c, ..) | NK::Not(c) | NK::For { cond: Some(c), .. } | NK::Do { cond: c, .. } => self.truth128(c),
+            NK::LogAnd(l, r) | NK::LogOr(l, r) => {
+                self.truth128(l);
+                self.truth128(r);
+            }
+            NK::Switch { cond, cases, .. } if wide(&cond.ty) => {
+                // The case labels are 64-bit constants: a value that is not the
+                // extension of its low word matches none of them. The switch is
+                // on the low word then, or else on a number that is no label.
+                let Type::Struct(sd) = &*cond.ty else { unreachable!() };
+                let words = sd.borrow().members.clone();
+                let var = self.new_lvar("", cond.ty.clone());
+                let var = self.lvar(var, loc);
+                let word = |i: usize| new_cast(new_member(var.clone(), &words[i], loc), ty_long());
+                let fits = new_binary(Op::Eq, word(1), new_binary(Op::Shr, word(0), num(63, loc), loc), loc);
+                let no_label = (i64::MIN..).find(|v| !cases.iter().any(|c| c.0 <= *v && *v <= c.1)).unwrap();
+                let low = mk(NK::Cond(bx(fits), bx(word(0)), bx(lnum(no_label, loc))), ty_long(), loc);
+                **cond = new_comma(new_assign(var, std::mem::replace(cond, num(0, loc)), loc), low, loc);
+            }
+            _ => {}
+        }
+        let ty = n.ty.clone();
+        let take = |n: &mut Node| std::mem::replace(n, num(0, loc));
+        let new = match &mut n.kind {
+            NK::Cast(l) if wide(&ty) && wide(&l.ty) => Node { ty, ..take(l) }, // only the signedness can differ
+            NK::Cast(l) if wide(&ty) => {
+                let (from, l) = (l.ty.clone(), take(l));
+                match (&*from, ty.i128() == Some(true)) {
+                    (Type::Float, false) => self.call128("__fixsfti", vec![l], &ty, loc),
+                    (Type::Float, true) => self.call128("__fixunssfti", vec![l], &ty, loc),
+                    (Type::Double, false) => self.call128("__fixdfti", vec![l], &ty, loc),
+                    (Type::Double, true) => self.call128("__fixunsdfti", vec![l], &ty, loc),
+                    (Type::LDouble, false) => self.call128("__fixxfti", vec![l], &ty, loc),
+                    (Type::LDouble, true) => self.call128("__fixunsxfti", vec![l], &ty, loc),
+                    // An integer or a pointer is widened as its own type says.
+                    _ if from.is_unsigned() => self.call128("__rcc_zext128", vec![new_cast(l, ty_ulong())], &ty, loc),
+                    _ => self.call128("__rcc_sext128", vec![new_cast(l, ty_long())], &ty, loc),
+                }
+            }
+            NK::Cast(l) if wide(&l.ty) && !matches!(*ty, Type::Void) => {
+                let (unsigned, l) = (l.ty.i128() == Some(true), take(l));
+                match (&*ty, unsigned) {
+                    (Type::Bool, _) => new_cast(self.call128("__rcc_nz128", vec![l], &ty_int(), loc), ty),
+                    (Type::Float, false) => self.call128("__floattisf", vec![l], &ty, loc),
+                    (Type::Float, true) => self.call128("__floatuntisf", vec![l], &ty, loc),
+                    (Type::Double, false) => self.call128("__floattidf", vec![l], &ty, loc),
+                    (Type::Double, true) => self.call128("__floatuntidf", vec![l], &ty, loc),
+                    (Type::LDouble, false) => self.call128("__floattixf", vec![l], &ty, loc),
+                    (Type::LDouble, true) => self.call128("__floatuntixf", vec![l], &ty, loc),
+                    _ => new_cast(Self::low128(l), ty), // a narrower integer, or a pointer: the low word
+                }
+            }
+            NK::Neg(l) if wide(&ty) => self.call128("__rcc_neg128", vec![take(l)], &ty, loc),
+            NK::BitNot(l) if wide(&ty) => self.call128("__rcc_not128", vec![take(l)], &ty, loc),
+            NK::Bin(op, l, r) if wide(&l.ty) => {
+                let (op, unsigned, wide_ty) = (*op, l.ty.i128() == Some(true), l.ty.clone());
+                let (l, r) = (take(l), take(r));
+                let not = |n: Node| mk(NK::Not(bx(n)), ty_int(), loc);
+                let less = if unsigned { "__rcc_ult128" } else { "__rcc_slt128" };
+                match op {
+                    Op::Add => self.call128("__rcc_add128", vec![l, r], &ty, loc),
+                    Op::Sub => self.call128("__rcc_sub128", vec![l, r], &ty, loc),
+                    Op::BitAnd => self.call128("__rcc_and128", vec![l, r], &ty, loc),
+                    Op::BitOr => self.call128("__rcc_or128", vec![l, r], &ty, loc),
+                    Op::BitXor => self.call128("__rcc_xor128", vec![l, r], &ty, loc),
+                    Op::Mul => self.call128("__multi3", vec![l, r], &ty, loc),
+                    Op::Div => self.call128(if unsigned { "__udivti3" } else { "__divti3" }, vec![l, r], &ty, loc),
+                    Op::Mod => self.call128(if unsigned { "__umodti3" } else { "__modti3" }, vec![l, r], &ty, loc),
+                    Op::Shl | Op::Shr => {
+                        let count = new_cast(if wide(&r.ty) { Self::low128(r) } else { r }, ty_int());
+                        let name = if op == Op::Shl { "__ashlti3" } else if unsigned { "__lshrti3" } else { "__ashrti3" };
+                        self.call128(name, vec![l, count], &wide_ty, loc)
+                    }
+                    Op::Eq => self.call128("__rcc_eq128", vec![l, r], &ty_int(), loc),
+                    Op::Ne => not(self.call128("__rcc_eq128", vec![l, r], &ty_int(), loc)),
+                    Op::Lt => self.call128(less, vec![l, r], &ty_int(), loc),
+                    Op::Le => not(self.call128(less, vec![r, l], &ty_int(), loc)),
+                }
+            }
+            _ => return,
+        };
+        *n = new;
     }
 
     // ----- initializers -----
@@ -1829,7 +2067,7 @@ impl Parser {
                     self.array_init2(init, 0);
                 }
             }
-            Type::Struct(sd) => {
+            Type::Struct(sd) if ty.is_record() => {
                 let is_union = sd.borrow().is_union;
                 if self.is("{") {
                     if is_union { self.union_init(init) } else { self.struct_init1(init) }
@@ -1927,6 +2165,11 @@ impl Parser {
                 for (i, c) in init.children.iter().enumerate() {
                     self.write_gvar_data(c, buf, off + sz * i as i64, relocs);
                 }
+            }
+            Type::Struct(_) if init.ty.i128().is_some() => {
+                let Some(e) = &init.expr else { return };
+                let Some(v) = eval128(e) else { err(e.loc, "initializer element is not constant") };
+                buf[off as usize..off as usize + 16].copy_from_slice(&v.to_le_bytes());
             }
             Type::Struct(sd) => {
                 if let Some(e) = &init.expr {
@@ -2056,6 +2299,8 @@ impl Parser {
             if self.consume("=") {
                 let e = self.lvar_initializer(l);
                 out.push(mk(NK::ExprStmt(bx(e)), ty_void(), loc));
+            } else {
+                out.push(mk(NK::Undef(l), ty_void(), loc));
             }
         }
         mk(NK::Block(out), ty_void(), loc)
@@ -2125,7 +2370,7 @@ impl Parser {
             if let Type::Void = &*self.ret_ty {
                 return mk(NK::Block(vec![mk(NK::ExprStmt(bx(e)), void.clone(), loc), mk(NK::Return(None), void.clone(), loc)]), void, loc);
             }
-            if !self.ret_ty.is_struct() {
+            if !self.ret_ty.is_record() {
                 e = new_cast(e, self.ret_ty.clone());
             }
             return mk(NK::Return(Some(bx(e))), void, loc);
@@ -2288,7 +2533,7 @@ impl Parser {
                 let (class, node) = if has("@") {
                     self.err("asm flag outputs (\"=@cc...\") are not supported")
                 } else if has("0123456789") || (scalar && has("rqQRlgXabcdSDA")) {
-                    let tmp = self.new_lvar("", if out { e.ty.clone() } else { ty });
+                    let tmp = self.new_lvar("", if out { e.ty.without(!0) } else { ty.without(!0) });
                     let var = self.lvar(tmp, loc);
                     if out {
                         // The lvalue is evaluated once, before the statement (a
@@ -2349,8 +2594,50 @@ impl Parser {
         n
     }
 
+    /// Assignment to an atomic object as one indivisible step: `lhs = rhs`
+    /// (no `op`) is an exchange, `lhs op= rhs` a compare-and-swap loop. Both are
+    /// asm statements built here, so the code generator has no atomics of its own.
+    fn atomic_assign(&mut self, op: Option<Op>, lhs: Node, rhs: Node, loc: Loc) -> Node {
+        let ty = lhs.ty.without(!0);
+        let var = |p: &mut Parser, ty: Ty| {
+            let i = p.new_lvar("", ty);
+            p.lvar(i, loc)
+        };
+        let stmt = |e: Node| mk(NK::ExprStmt(bx(e)), ty_void(), loc);
+        let reg = |cons: &str, node: &Node, out: bool, inp: bool| AsmOp { cons: cons.into(), name: None, class: AsmClass::Reg, node: node.clone(), out, inp };
+        let asm = |text: &str, ops: Vec<AsmOp>| mk(NK::AsmOps(text.into(), ops, vec![]), ty_void(), loc);
+        let addr = var(self, ptr_to(ty.clone()));
+        let val = var(self, if op.is_some() { decay(&rhs.ty) } else { ty.clone() });
+        let new = var(self, ty.clone());
+        let target = AsmOp { cons: "m".into(), name: None, class: AsmClass::Mem, node: new_deref(addr.clone(), loc), out: true, inp: true };
+        let mut stmts = vec![stmt(new_assign(addr.clone(), new_addr(lhs, loc), loc)), stmt(new_assign(val.clone(), rhs, loc))];
+        match op {
+            None => {
+                // new = val; exchange new with *addr. The value of the expression is val.
+                stmts.push(stmt(new_assign(new.clone(), val.clone(), loc)));
+                stmts.push(asm("xchg %0, %1", vec![reg("r", &new, true, true), target]));
+                stmts.push(stmt(val));
+            }
+            Some(op) => {
+                // old = *addr; do new = old op val; while (*addr != old: then old = *addr; else *addr = new);
+                let (old, ok) = (var(self, ty.clone()), var(self, ty_bool()));
+                stmts.push(stmt(new_assign(old.clone(), new_deref(addr.clone(), loc), loc)));
+                let step = stmt(new_assign(new.clone(), new_binary(op, old.clone(), val, loc), loc));
+                let cas = asm("lock cmpxchg %3, %1\n\tsete %0", vec![reg("q", &ok, true, false), target, reg("a", &old, true, true), reg("r", &new, false, true)]);
+                let body = bx(mk(NK::Block(vec![step, cas]), ty_void(), loc));
+                let cond = bx(mk(NK::Not(bx(ok)), ty_int(), loc));
+                stmts.push(mk(NK::Do { body, cond, brk: self.label(), cont: self.label() }, ty_void(), loc));
+                stmts.push(stmt(new));
+            }
+        }
+        mk(NK::StmtExpr(stmts), ty, loc)
+    }
+
     /// Lowers `lhs op= rhs`.
     fn op_assign(&mut self, op: Op, lhs: Node, rhs: Node, loc: Loc) -> Node {
+        if atomic_scalar(&lhs.ty) {
+            return self.atomic_assign(Some(op), lhs, rhs, loc);
+        }
         if matches!(lhs.kind, NK::LVar(_) | NK::GVar(_)) {
             let b = new_binary(op, lhs.clone(), rhs, loc);
             return new_assign(lhs, b, loc);
@@ -2378,7 +2665,7 @@ impl Parser {
         let loc = self.loc();
         if self.consume("=") {
             let r = self.assign();
-            return new_assign(n, r, loc);
+            return if atomic_scalar(&n.ty) { self.atomic_assign(None, n, r, loc) } else { new_assign(n, r, loc) };
         }
         const OPS: [(&str, Op); 10] = [
             ("+=", Op::Add), ("-=", Op::Sub), ("*=", Op::Mul), ("/=", Op::Div), ("%=", Op::Mod),
@@ -2492,10 +2779,10 @@ impl Parser {
                 return self.unary();
             }
             let e = self.cast();
-            if ty.is_struct() || matches!(*ty, Type::Void) {
+            if ty.is_record() || matches!(*ty, Type::Void) {
                 return mk(NK::Cast(bx(e)), ty, loc);
             }
-            if e.ty.is_struct() {
+            if e.ty.is_record() {
                 err(loc, "invalid cast");
             }
             if matches!(&e.kind, NK::Member(_, m) if m.bit_width >= 0) {
@@ -2682,7 +2969,7 @@ impl Parser {
             }
             let mut a = self.assign();
             if let Some(pty) = fty.params.get(args.len()) {
-                if !pty.is_struct() {
+                if !pty.is_record() {
                     a = new_cast(a, pty.clone());
                 }
             } else if let Type::Float = &*a.ty {
@@ -2786,8 +3073,8 @@ impl Parser {
             return n;
         }
         if self.consume("_Generic") {
-            // shortcut: qualifiers are not part of rcc's types and `long`/`long long`
-            // (and `char`/`signed char`) are one type, so the first such association wins.
+            // shortcut: `long`/`long long` (and `char`/`signed char`) are one type in
+            // rcc, so the first such association wins.
             self.expect("(");
             let ctrl = decay(&self.assign().ty);
             let (mut chosen, mut dflt) = (None, None);
@@ -2801,7 +3088,8 @@ impl Parser {
                 let ty = self.typename();
                 self.expect(":");
                 let e = self.assign();
-                if chosen.is_none() && same_type(&ctrl, &ty) {
+                // The controlling expression is an rvalue: no qualified type matches it.
+                if chosen.is_none() && ty.quals == 0 && same_type(&ctrl, &ty) {
                     chosen = Some(e);
                 }
             }
@@ -2988,7 +3276,7 @@ impl Parser {
                             _ if name.strip_suffix('f').is_some_and(|b| MATH.contains(&b)) => ty_float(),
                             _ => ty_int(),
                         };
-                        let fty = Rc::new(Type::Func(Rc::new(FuncTy { ret, params: vec![], names: vec![], variadic: false, oldstyle: true })));
+                        let fty = Ty::new(Type::Func(Rc::new(FuncTy { ret, params: vec![], names: vec![], variadic: false, oldstyle: true })));
                         let i = self.declare_func(name, fty, &Attr::default());
                         self.scopes[0].vars.insert(t.s.clone(), VS::Global(i));
                         self.gvar(i, loc)
