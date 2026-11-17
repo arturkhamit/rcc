@@ -13,10 +13,10 @@ const ARG64: [&str; 6] = ["%rdi", "%rsi", "%rdx", "%rcx", "%r8", "%r9"];
 
 /// General-purpose registers by their 16-bit names. An asm statement takes the
 /// registers of its operands from the first nine; the rest are callee-saved.
-const GP: [&str; 14] = ["ax", "cx", "dx", "si", "di", "r8", "r9", "r10", "r11", "bx", "r12", "r13", "r14", "r15"];
+pub const GP: [&str; 14] = ["ax", "cx", "dx", "si", "di", "r8", "r9", "r10", "r11", "bx", "r12", "r13", "r14", "r15"];
 
 /// The name of a general-purpose register at an operand size; size 0 is the high byte (`%ah`).
-fn reg_name(r: &str, size: i64) -> String {
+pub fn reg_name(r: &str, size: i64) -> String {
     if r.starts_with('r') {
         return format!("%{}{}", r, ["", "b", "w", "", "d"].get(size as usize).unwrap_or(&""));
     }
@@ -45,7 +45,7 @@ pub fn has_flonum(ty: &Ty, lo: i64, hi: i64, off: i64) -> bool {
 
 /// Decides whether an argument of the given type is passed in registers,
 /// updating the counts of used general-purpose and SSE registers.
-fn in_regs(ty: &Ty, gp: &mut usize, fp: &mut usize) -> bool {
+pub fn in_regs(ty: &Ty, gp: &mut usize, fp: &mut usize) -> bool {
     let (ng, nf) = match &**ty {
         Type::LDouble => return false,
         Type::Struct(_) => {
@@ -90,6 +90,8 @@ struct Gen<'a> {
     offs: Vec<i64>,
     va: (usize, usize, i64), // gp regs used, fp regs used, start of stack args
     has_asm: bool,           // the current function contains an asm statement
+    label_funcs: HashSet<&'a str>, // functions with a label whose address is in static data
+    irs: HashMap<&'a str, crate::ir::Func>, // -O: the optimized functions, ready to be emitted
     debug: bool,
     last_loc: (u32, u32), // source position of the last .loc directive
 }
@@ -97,10 +99,30 @@ struct Gen<'a> {
 /// `pic`: the code may go into a shared library, where a global symbol can be
 /// preempted and so must be reached through the GOT even if defined here.
 /// `debug`: emit line number information (`-g`).
-pub fn codegen(globals: &[Obj], top_asm: &[String], pic: bool, debug: bool) -> String {
-    let mut g = Gen { out: String::new(), depth: 0, cnt: 0, defined: HashSet::new(), tls: HashSet::new(), func: None, offs: vec![], va: (0, 0, 0), has_asm: false, debug, last_loc: (0, 0) };
+pub fn codegen(globals: &[Obj], top_asm: &[String], pic: bool, debug: bool, optimize: bool) -> String {
+    let stats = std::env::var_os("RCC_STATS").is_some(); // report the functions the optimizer declines
+    let label_funcs = globals.iter().flat_map(|o| &o.relocs).filter_map(|r| r.label.strip_prefix(".L.u.")?.split('.').next()).collect();
+    let mut g = Gen { out: String::new(), depth: 0, cnt: 0, defined: HashSet::new(), tls: HashSet::new(), func: None, offs: vec![], va: (0, 0, 0), has_asm: false, label_funcs, irs: HashMap::new(), debug, last_loc: (0, 0) };
     g.tls = globals.iter().filter(|o| o.is_tls).map(|o| o.name.as_str()).collect();
     g.defined = globals.iter().filter(|o| o.is_def && (o.is_static || !pic)).map(|o| o.name.as_str()).collect();
+
+    if optimize {
+        // The functions the optimizing back end can compile, lowered and optimized together.
+        let cx = crate::ir::Ctx { defined: &g.defined, tls: &g.tls, debug };
+        let funcs: Vec<&Obj> = globals.iter().filter(|o| o.is_def && o.is_func && !g.label_funcs.contains(o.name.as_str())).collect();
+        let mut irs = HashMap::new();
+        for o in &funcs {
+            match crate::ir::lower(o, &cx) {
+                Ok(func) => drop(irs.insert(o.name.as_str(), func)),
+                Err(why) if stats => eprintln!("rcc: not optimized: {}: {}", why, o.name),
+                Err(_) => {}
+            }
+        }
+        let order: Vec<&str> = funcs.iter().map(|o| o.name.as_str()).collect();
+        let inlinable: HashSet<&str> = funcs.iter().filter(|o| g.defined.contains(o.name.as_str()) && !o.sym.weak && !o.sym.noinline).map(|o| o.name.as_str()).collect();
+        crate::pass::optimize_all(&mut irs, &order, &inlinable);
+        g.irs = irs;
+    }
 
     // Every function is generated, but a static one is kept only if code that is
     // kept refers to it. Going by the generated text rather than by the source
@@ -309,6 +331,12 @@ impl<'a> Gen<'a> {
             let loc = f.body.as_ref().unwrap().loc;
             emit!(self, "  .loc {} {}", loc.0 + 1, loc.1);
         }
+        if let Some(func) = self.irs.remove(f.name.as_str()) {
+            let id = self.next();
+            self.out.push_str(&crate::x86::emit(&func, id));
+            emit!(self, "  .size {}, .-{}", f.name, f.name);
+            return self.end_func(f);
+        }
         // The .cfi directives describe the frame for unwinders and debuggers.
         emit!(self, "  .cfi_startproc\n  push %rbp\n  .cfi_def_cfa_offset 16\n  .cfi_offset %rbp, -16\n  mov %rsp, %rbp\n  .cfi_def_cfa_register %rbp");
         emit!(self, "  sub ${}, %rsp", align_to(bottom, 16));
@@ -375,6 +403,10 @@ impl<'a> Gen<'a> {
             self.out.truncate(start);
             self.out.push_str(&text);
         }
+        self.end_func(f);
+    }
+
+    fn end_func(&mut self, f: &Obj) {
         for (on, sec) in [(f.sym.ctor, "init"), (f.sym.dtor, "fini")] {
             if on {
                 emit!(self, "  .section .{}_array,\"aw\",@{}_array\n  .balign 8\n  .quad {}", sec, sec, f.name);
@@ -1327,12 +1359,12 @@ impl<'a> Gen<'a> {
     // ----- statements -----
 
     fn gen_stmt(&mut self, n: &Node) {
-        if self.debug && n.loc != self.last_loc && !matches!(n.kind, NK::Block(_) | NK::Nop) {
+        if self.debug && n.loc != self.last_loc && !matches!(n.kind, NK::Block(_) | NK::Nop | NK::Undef(_)) {
             emit!(self, "  .loc {} {}", n.loc.0 + 1, n.loc.1);
             self.last_loc = n.loc;
         }
         match &n.kind {
-            NK::Nop => {}
+            NK::Nop | NK::Undef(_) => {}
             NK::Return(e) => {
                 let f = self.func.unwrap();
                 if let Some(e) = e {
