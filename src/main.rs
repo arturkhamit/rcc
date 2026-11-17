@@ -1,7 +1,10 @@
 mod codegen;
+mod ir;
+mod x86;
 mod lex;
 mod opt;
 mod parse;
+mod pass;
 mod preprocess;
 mod types;
 
@@ -28,6 +31,7 @@ struct Opts {
     includes: Vec<String>,        // -include
     pic: bool,                    // -fPIC or -shared
     debug: bool,                  // -g
+    optimize: bool,               // -O1 and up
 }
 
 /// Returns the tokens of the builtin prelude and of the translation unit.
@@ -53,7 +57,9 @@ fn compile(path: &str, opts: &Opts) -> String {
     toks.extend(unit);
     let toks = lex::convert(toks);
     let (globals, top_asm) = parse::parse(toks);
-    codegen::codegen(&globals, &top_asm, opts.pic, opts.debug)
+    // RCC_OPT=0 or =1 overrides the -O flags: for testing a build system's flags both ways.
+    let optimize = std::env::var("RCC_OPT").map_or(opts.optimize, |v| v != "0");
+    codegen::codegen(&globals, &top_asm, opts.pic, opts.debug, optimize)
 }
 
 fn with_ext(path: &str, ext: &str) -> String {
@@ -150,6 +156,7 @@ fn main() {
             }
             "-fPIC" | "-fpic" => opts.pic = true,
             "-g0" => opts.debug = false,
+            _ if a.starts_with("-O") => opts.optimize = a != "-O0",
             _ if a.starts_with("-g") => opts.debug = true,
             "-shared" => {
                 opts.pic = true;
