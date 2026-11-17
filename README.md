@@ -17,17 +17,19 @@ It works as a drop-in `CC` for ordinary build systems (`make CC=rcc`,
 `CC=rcc ./configure`). Options: `-o -c -S -E -I -isystem -iquote -idirafter -D -U
 -include -x c -l -L -Wl, -Xlinker -shared -static -pthread -fPIC`, dependency
 output (`-MD -MMD -MF -MT -MQ -MP -M -MM`), `-` for standard input, `--version`,
-`-dumpmachine`. `-g` adds line numbers and unwind information (source lines and
-backtraces in gdb; no variables). Other flags (`-O2`, `-W...`, `-std=...`,
-`-f...`, `-m...`) are accepted and ignored. Use `-fPIC` for code that goes into a
-shared library.
+`-dumpmachine`. `-O1` and higher turn the optimizer on (all levels are the
+same); without it, or with `-O0`, the code is straightforward and compiles
+fastest. `-g` adds line numbers and unwind information (source lines and
+backtraces in gdb; no variables). Other flags (`-W...`, `-std=...`, `-f...`,
+`-m...`) are accepted and ignored. Use `-fPIC` for code that goes into a shared
+library.
 
 ## Status
 
 | Check | Result |
 |-------|--------|
-| [c-testsuite](https://github.com/c-testsuite/c-testsuite) and local tests (compared with gcc) | 232 / 233 |
-| gcc.c-torture/execute (GCC's own torture tests) | 1567 / 1701 |
+| [c-testsuite](https://github.com/c-testsuite/c-testsuite) and local tests (compared with gcc) | 234 / 234 |
+| gcc.c-torture/execute (GCC's own torture tests) | 1569 / 1701 |
 | ABI: objects from rcc and gcc calling each other (`tests/interop`) | passes |
 | Lua 5.4.7, official test suite (`all.lua`) | passes |
 | SQLite 3.46 amalgamation | same query output as a gcc build |
@@ -35,26 +37,43 @@ shared library.
 | bzip2 1.0.8 (`make`, including its self-test) | passes |
 | lz4 1.10.0 (command-line tests, frame test, fuzzer) | passes |
 | zstd 1.5.6 (command-line tests, unit tests, fuzzer) | passes |
-| QuickJS (`make test`; built without Temporal and Intl, which need `__int128`) | passes |
+| QuickJS, with Temporal and Intl (`make test`) | passes |
 | chibicc built with rcc, its test suite | passes |
 | tinycc built with rcc: compiles and runs programs and itself | passes |
 | tinycc's `tcctest.c` (without its inline-assembly part) | output equals gcc's, apart from three `__builtin_constant_p` lines only an optimizer folds |
 
-Of the torture tests that do not pass, 121 are rejected at compile time (nested
-functions, vector, complex and 128-bit types, `__builtin_setjmp` and the like)
+Of the torture tests that do not pass, 119 are rejected at compile time (nested
+functions, vector and complex types, `__builtin_setjmp` and the like)
 and 13 give a wrong result, on GNU-specific behaviour (bitfields wider than 32
 bits evaluated in their own width, `scalar_storage_order`,
 `-finstrument-functions`, const-qualified type compatibility).
 
-Speed of the generated code is that of `gcc -O0` or somewhat better; there is
-no optimizer beyond dead-code removal and operand selection.
+Every check above gives the same result with the optimizer on and off.
+
+Speed of the generated code (`tests/bench.sh`: seconds for the same workload,
+best of three runs; lower is better):
+
+| Workload | rcc | rcc -O1 | gcc -O0 | gcc -O2 |
+|---|---|---|---|---|
+| bzip2, compressing 9 MB of text | 0.95 | 0.53 | 0.82 | 0.46 |
+| lz4 -9, the same | 1.09 | 0.38 | 0.59 | 0.27 |
+| zstd -9, the same | 0.89 | 0.34 | 0.49 | 0.14 |
+| Lua: recursion, table sort, string formatting | 3.13 | 1.88 | 2.32 | 1.35 |
+| SQLite: inserts, index, joins, aggregates | 1.10 | 0.54 | 1.34 | 0.43 |
 
 Tests:
 
     ./fetch_tests.sh && ./run_tests.sh        # c-testsuite, local tests, gcc interop
-    ./fetch_tests.sh all                      # also the corpora for the two below
+    ./fetch_tests.sh all                      # also the corpora for the three below
     tests/torture.sh tests/ext/gcc-ts/gcc/testsuite/gcc.c-torture/execute
     tests/real.sh                             # Lua, SQLite, zlib, bzip2, lz4, zstd, QuickJS, chibicc, tinycc
+    tests/bench.sh                            # the table above
+
+The test scripts compile as the programs' own build systems ask (mostly with
+`-O2`). `RCC_OPT=1` in the environment turns the optimizer on whatever the
+flags, `RCC_OPT=0` off: `RCC_OPT=0 tests/real.sh` checks the simple code
+generator on everything. `RCC_STATS=1` lists the functions the optimizer left
+to the simple generator, and why.
 
 ## What is supported
 
@@ -63,8 +82,13 @@ Tests:
   parameters: `void f(int n, double a[n][n])`), `_Generic`, `_Alignas`,
   `_Alignof`, `_Static_assert`, `_Thread_local`, `_Noreturn`, variadic
   functions, K&R-style definitions.
-- `<stdatomic.h>`: `_Atomic(T)`, the `atomic_*` functions and `atomic_flag`,
-  lock-free for integers and pointers (`lock`-prefixed instructions).
+- `__int128` and `unsigned __int128` (`__int128_t`, `__uint128_t`), passed and
+  returned as gcc does. Their operators are calls: small functions for
+  addition, comparison and the like (inlined with `-O`), libgcc for
+  multiplication, division, shifts and conversions to and from floating point.
+- Atomics: `_Atomic` objects, whose operators (`x++`, `x += n`, `x = v`) are
+  atomic, and `<stdatomic.h>` with the `atomic_*` functions and `atomic_flag`.
+  Lock-free (`lock`-prefixed instructions) for objects of up to 8 bytes.
 - `long double` is the real x87 80-bit type; its constants keep the full 64-bit mantissa.
 - System V calling convention in full: structs in registers and in memory,
   `long double`, packed structs, varargs; verified against gcc in both directions.
@@ -97,13 +121,30 @@ Tests:
     src/parse.rs       recursive-descent parser -> typed AST, constant evaluation, initializers
     src/codegen.rs     AST -> x86-64 assembly (stack machine, System V calling convention)
     src/opt.rs         removal of unreachable code from the generated assembly
+    src/ir.rs          -O: AST -> three-address code over virtual registers, in basic blocks
+    src/pass.rs        -O: inlining, constant folding and propagation, common
+                       subexpressions, dead code, control-flow cleanup
+    src/x86.rs         -O: register allocation (linear scan) and x86-64 emission
     src/main.rs        driver
     include/           built-in headers (stddef.h, stdarg.h, stdatomic.h, ...) and
                        builtins.h, the GNU builtins that can be written in C
 
-The structure follows Rui Ueyama's [chibicc](https://github.com/rui314/chibicc):
-every expression is evaluated into `%rax` / `%xmm0` / `%st(0)`, with the machine
-stack for temporaries when an operand is not a constant or a variable.
+Without `-O` the structure follows Rui Ueyama's
+[chibicc](https://github.com/rui314/chibicc): every expression is evaluated
+into `%rax` / `%xmm0` / `%st(0)`, with the machine stack for temporaries when an
+operand is not a constant or a variable.
+
+With `-O` a function is first lowered to an intermediate representation, where
+scalar variables whose address is not taken are virtual registers. Small
+functions are inlined into their callers; constants and copies are propagated
+and folded; a computation or a load that was already done on the way is reused;
+what nothing uses is removed. Registers are then allocated by linear scan (the
+least used values go to the frame when registers run out), and a dense `switch`
+becomes a jump table. A function that uses something this path does not handle
+(a variadic definition, `long double`, `alloca` or a VLA, inline assembly, a
+computed `goto`, a call to `setjmp`) is compiled the simple way; the two kinds
+of code mix freely, as both follow the ABI. `volatile` objects are always read
+and written exactly as the source says.
 
 `__GNUC__` is deliberately not defined: glibc's headers then avoid GNU-only
 constructs.
@@ -113,15 +154,22 @@ constructs.
 - in inline assembly: operands in SSE or x87 registers (`"x"`, `"t"`), flag
   outputs (`"=@ccz"`), `asm goto`, `{att|intel}` alternatives, and local
   register variables (`register long r asm("r10")`)
-- `_Complex`, `__int128`, vector types, nested functions, `__builtin_setjmp`
-- `_Atomic` is honoured only by the `atomic_*` functions: a plain operator on an
-  atomic object (`x++`, `x += 1`) is an ordinary, non-atomic read and write
-- `const`/`volatile` are parsed and ignored: no diagnostics for writes to
-  `const` objects, and `_Generic` cannot tell `char *` from `const char *`
-  (nor `long` from `long long`)
+- `_Complex`, vector types, nested functions, `__builtin_setjmp`
+- for 128-bit integers: constants wider than 64 bits anywhere but in the
+  initializer of a static 128-bit object, `case` labels wider than 64 bits,
+  `va_arg`, bit-fields, and the overflow builtins on 128-bit operands
+- atomic objects larger than 8 bytes (structs, `long double`) are read and
+  written like plain ones
+- qualifiers are part of the types (`_Generic` tells `char *` from
+  `const char *`), but there are no diagnostics for writes to `const` objects,
+  and `long`/`long long` (and `char`/`signed char`) are one type to `_Generic`
 - constant expressions of type `long double` in static initializers are
   folded in double precision (plain constants are exact)
 - locals cannot be aligned to more than 16 bytes
 - few diagnostics for invalid programs: rcc assumes its input compiles with
   gcc or clang, and stops at the first error
-- debug info is line numbers only (no variables or types); no real optimizer
+- debug info is line numbers only (no variables or types); with `-O`, a
+  breakpoint on a function that was inlined does not trigger
+- the optimizer does no loop optimizations (hoisting, strength reduction,
+  vectorization), and inlines only small functions: `always_inline` is not seen,
+  since libraries request it only from compilers that define `__GNUC__`
