@@ -49,6 +49,7 @@ const PREDEFINED: &str = "
 #define __SIZEOF_DOUBLE__ 8
 #define __SIZEOF_LONG_DOUBLE__ 16
 #define __SIZEOF_POINTER__ 8
+#define __SIZEOF_INT128__ 16
 #define __SIZEOF_SIZE_T__ 8
 #define __SIZEOF_PTRDIFF_T__ 8
 #define __SIZE_TYPE__ unsigned long
