@@ -63,7 +63,7 @@ const KEYWORDS: &[&str] = &[
     "__restrict", "__restrict__", "_Noreturn", "float", "double", "typeof", "__typeof__", "__typeof", "inline",
     "__inline", "__inline__", "_Thread_local", "__thread", "_Atomic", "__attribute__", "__asm__", "__asm", "asm",
     "__signed__", "__signed", "__const", "__volatile__", "__volatile", "_Static_assert", "__alignof__", "__alignof",
-    "_Generic", "__label__",
+    "_Generic", "__label__", "__int128",
 ];
 
 const PUNCTS: &[&str] = &[
