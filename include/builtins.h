@@ -47,8 +47,8 @@ unsigned long __bswapdi2(unsigned long);
 #define __builtin_expect_with_probability(e, v, p) (e)
 #define __builtin_assume_aligned(p, ...) (p)
 
-/* Overflow-checked arithmetic: the operands as sign + magnitude, the result
-   checked against the width and signedness of *r. */
+/* Overflow-checked arithmetic: the operands as sign + magnitude (of up to 64
+   bits), the result checked against the width and signedness of *r. */
 static int __rcc_ovf(int op, unsigned long a, int na, unsigned long b, int nb, int bits, int sgn, unsigned long *out) {
   unsigned long m, max;
   int n, carry = 0;
@@ -57,17 +57,19 @@ static int __rcc_ovf(int op, unsigned long a, int na, unsigned long b, int nb, i
   else if (na == nb) { m = a + b; n = na; carry = m < a; }
   else if (a >= b) { m = a - b; n = na; }
   else { m = b - a; n = nb; }
-  *out = n ? -m : m;
-  if (carry) return 1;
+  *out = m;
+  n <<= 1; /* the result: bit 0 says overflow, bit 1 that the value is -m */
+  if (carry) return n | 1;
   if (!m) return 0;
+  if (bits > 64) return n | (n && !sgn); /* a 128-bit result holds any value but, if unsigned, a negative one */
   max = bits == 64 && !sgn ? -1UL : (1UL << (bits - sgn)) - 1;
-  if (sgn) return n ? m > max + 1 : m > max;
-  return n ? 1 : m > max;
+  if (sgn) return n | (n ? m > max + 1 : m > max);
+  return n | (n ? 1 : m > max);
 }
 #define __rcc_ovf_m(op, a, b, r) ({ __typeof__(a) __a = (a); __typeof__(b) __b = (b); __typeof__(r) __r = (r); unsigned long __o; \
   int __f = __rcc_ovf(op, __a < 0 ? -(unsigned long)__a : (unsigned long)__a, __a < 0, __b < 0 ? -(unsigned long)__b : (unsigned long)__b, __b < 0, \
                       (__typeof__(*__r))2 == 1 ? 1 : (int)sizeof(*__r) * 8, (__typeof__(*__r))-1 < 0, &__o); \
-  *__r = (__typeof__(*__r))__o; __f; })
+  *__r = __f & 2 ? -(__typeof__(*__r))__o : (__typeof__(*__r))__o; __f & 1; })
 #define __builtin_add_overflow(a, b, r) __rcc_ovf_m(0, a, b, r)
 #define __builtin_sub_overflow(a, b, r) __rcc_ovf_m(1, a, b, r)
 #define __builtin_mul_overflow(a, b, r) __rcc_ovf_m(2, a, b, r)
@@ -110,3 +112,28 @@ static int __rcc_ovf(int op, unsigned long a, int na, unsigned long b, int nb, i
 #define __atomic_fetch_and(p, v, o) __rcc_atomic_rmw(p, &, v)
 #define __atomic_fetch_or(p, v, o) __rcc_atomic_rmw(p, |, v)
 #define __atomic_fetch_xor(p, v, o) __rcc_atomic_rmw(p, ^, v)
+
+/* 128-bit integers. The compiler stores and passes one as two words, and turns
+   its operators into calls of these functions, or of libgcc's for
+   multiplication, division, shifts and conversions to and from floating point. */
+struct __rcc_i128 { unsigned long lo, hi; };
+static struct __rcc_i128 __rcc_sext128(long v) { struct __rcc_i128 r; r.lo = v; r.hi = v < 0 ? -1UL : 0; return r; }
+static struct __rcc_i128 __rcc_zext128(unsigned long v) { struct __rcc_i128 r; r.lo = v; r.hi = 0; return r; }
+static struct __rcc_i128 __rcc_add128(struct __rcc_i128 a, struct __rcc_i128 b) { struct __rcc_i128 r; r.lo = a.lo + b.lo; r.hi = a.hi + b.hi + (r.lo < a.lo); return r; }
+static struct __rcc_i128 __rcc_sub128(struct __rcc_i128 a, struct __rcc_i128 b) { struct __rcc_i128 r; r.lo = a.lo - b.lo; r.hi = a.hi - b.hi - (a.lo < b.lo); return r; }
+static struct __rcc_i128 __rcc_and128(struct __rcc_i128 a, struct __rcc_i128 b) { a.lo &= b.lo; a.hi &= b.hi; return a; }
+static struct __rcc_i128 __rcc_or128(struct __rcc_i128 a, struct __rcc_i128 b) { a.lo |= b.lo; a.hi |= b.hi; return a; }
+static struct __rcc_i128 __rcc_xor128(struct __rcc_i128 a, struct __rcc_i128 b) { a.lo ^= b.lo; a.hi ^= b.hi; return a; }
+static struct __rcc_i128 __rcc_not128(struct __rcc_i128 a) { a.lo = ~a.lo; a.hi = ~a.hi; return a; }
+static struct __rcc_i128 __rcc_neg128(struct __rcc_i128 a) { a.hi = -a.hi - (a.lo != 0); a.lo = -a.lo; return a; }
+static int __rcc_nz128(struct __rcc_i128 a) { return (a.lo | a.hi) != 0; }
+static int __rcc_eq128(struct __rcc_i128 a, struct __rcc_i128 b) { return ((a.lo ^ b.lo) | (a.hi ^ b.hi)) == 0; }
+static int __rcc_ult128(struct __rcc_i128 a, struct __rcc_i128 b) { return a.hi < b.hi || (a.hi == b.hi && a.lo < b.lo); }
+static int __rcc_slt128(struct __rcc_i128 a, struct __rcc_i128 b) { return (long)a.hi < (long)b.hi || (a.hi == b.hi && a.lo < b.lo); }
+struct __rcc_i128 __multi3(struct __rcc_i128, struct __rcc_i128), __divti3(struct __rcc_i128, struct __rcc_i128), __udivti3(struct __rcc_i128, struct __rcc_i128);
+struct __rcc_i128 __modti3(struct __rcc_i128, struct __rcc_i128), __umodti3(struct __rcc_i128, struct __rcc_i128);
+struct __rcc_i128 __ashlti3(struct __rcc_i128, int), __ashrti3(struct __rcc_i128, int), __lshrti3(struct __rcc_i128, int);
+struct __rcc_i128 __fixsfti(float), __fixunssfti(float), __fixdfti(double), __fixunsdfti(double), __fixxfti(long double), __fixunsxfti(long double);
+float __floattisf(struct __rcc_i128), __floatuntisf(struct __rcc_i128);
+double __floattidf(struct __rcc_i128), __floatuntidf(struct __rcc_i128);
+long double __floattixf(struct __rcc_i128), __floatuntixf(struct __rcc_i128);
